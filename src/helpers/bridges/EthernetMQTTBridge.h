@@ -152,6 +152,12 @@ private:
   unsigned long _last_connect_attempt;
   uint8_t _backoff;
   uint32_t _broker_reconnects;
+  // Cached DNS results: resolveHost() must run before any socket-holding
+  // connect()/beginPacket() call, never a hostname string, or the RAK13800
+  // library resolves it internally (blocking loop() ~15s and briefly opening
+  // a fifth UDP socket on a four-socket chip). Unset == IPAddress((uint32_t)0).
+  IPAddress _broker_ip;
+  IPAddress _ntp_ip;
   unsigned long _outage_started_at;
   unsigned long _publish_ok, _publish_err;
   const char* _slot_state;  // "inactive" | "wait" | "ok" | "fail" | "disc"
@@ -182,6 +188,10 @@ private:
 
   bool linkReady() const;
   void refreshLink(unsigned long now);
+  // Resolves a dotted-quad literal instantly via IPAddress::fromString(), else
+  // does a single DNSClient::getHostByName() with a bounded 1000ms timeout.
+  // Never pass `host` on to connect()/beginPacket() directly.
+  bool resolveHost(const char* host, IPAddress& out) const;
   bool connectBroker(unsigned long now);
   void onDisconnected(unsigned long now);
   bool topicFor(const char* suffix, char* buf, size_t buf_size) const;

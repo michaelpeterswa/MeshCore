@@ -8,7 +8,7 @@
 #include "helpers/JWTHelper.h"
 #include <EthernetUdp.h>
 #include <NTPClient.h>
-#include <malloc.h>
+#include <Dns.h>
 #include <string.h>
 
 EthernetMQTTBridge* EthernetMQTTBridge::s_instance = nullptr;
@@ -18,7 +18,8 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
   : BridgeBase(prefs, mgr, rtc), _obs(obs), _eth(nullptr), _identity(identity),
     _dispatcher(nullptr), _radio(nullptr), _board(nullptr), _ms(nullptr), _neighbor_source(nullptr),
     _client(_net), _link_up(false), _link_changed_at(0), _link_changes(0),
-    _last_connect_attempt(0), _backoff(0), _broker_reconnects(0), _outage_started_at(0),
+    _last_connect_attempt(0), _backoff(0), _broker_reconnects(0),
+    _broker_ip((uint32_t)0), _ntp_ip((uint32_t)0), _outage_started_at(0),
     _publish_ok(0), _publish_err(0), _slot_state("inactive"), _time_synced(false),
     _next_status_at(0), _next_ntp_at(0), _next_neighbors_at(0), _next_link_at(0), _next_auth_at(0),
     _staged_raw_len(0), _staged_snr(0), _staged_rssi(0), _staged_valid(false),
@@ -77,8 +78,26 @@ void EthernetMQTTBridge::refreshLink(unsigned long now) {
       if (_client.connected()) _client.disconnect();
       onDisconnected(now);
     }
-    _next_link_at = 0;   // publish link change as soon as the broker is reachable
+    // "fire immediately": = now, not 0. now - 0 only stays non-negative under
+    // (long) for the first ~24.8 days of uptime; now - now is always exactly
+    // due and stays wrap-safe forever.
+    _next_link_at = now;
   }
+}
+
+// Never hand a hostname to connect()/beginPacket(): the RAK13800 library
+// resolves it internally via a blocking, ~5s/3-retry DNSClient lookup that
+// also opens its own UDP socket (RAK13800-W5100S/src/EthernetClient.cpp:26-38,
+// RAK13800-W5100S/src/Dns.cpp), which can stall loop() for ~15s and exhaust
+// the W5100S's four sockets alongside telnet + MQTT + NTP. Resolve here with a
+// short bounded timeout instead, and pass only the resulting IPAddress on.
+bool EthernetMQTTBridge::resolveHost(const char* host, IPAddress& out) const {
+  if (!host || host[0] == '\0') return false;
+  if (out.fromString(host)) return true;   // dotted-quad literal: no DNS needed
+  DNSClient dns;
+  dns.begin(Ethernet.dnsServerIP());
+  int rc = dns.getHostByName(host, out, 1000);
+  return rc == 1;
 }
 
 bool EthernetMQTTBridge::topicFor(const char* suffix, char* buf, size_t buf_size) const {
@@ -106,6 +125,16 @@ void EthernetMQTTBridge::begin() {
   _net.setConnectionTimeout(1500);
   _backoff = 0;
   _last_connect_attempt = 0;
+  // Explicit "= millis()" rather than relying on the constructor's 0: the
+  // constructor's 0 only reads as "due now" because millis() is still small
+  // at boot; begin() can run later (e.g. after end()/begin() cycling), so set
+  // these the same wrap-safe way refreshLink()/connectBroker() do.
+  unsigned long boot_now = millis();
+  _next_status_at = boot_now;
+  _next_link_at = boot_now;
+  _next_ntp_at = boot_now;
+  _next_neighbors_at = boot_now;
+  _next_auth_at = boot_now;
   _slot_state = isConfigValid(_obs) ? "wait" : "inactive";
   _initialized = true;
   ETH_MQTT_LOG("bridge begin, iata=%s origin=%s", _iata, _origin);
@@ -164,7 +193,22 @@ bool EthernetMQTTBridge::connectBroker(unsigned long now) {
   _last_connect_attempt = now;
   char host[64]; uint16_t port; const char* user; const char* pass;
   resolveBroker(_obs, host, sizeof(host), &port, &user, &pass);
-  _client.setServer(host, port);
+
+  // Re-resolve only when the cache is empty (never resolved, or invalidated
+  // by a previous failure / preset change) — never pass `host` on to
+  // _client.connect(const char*, ...), which would trigger the RAK13800
+  // library's internal blocking hostname lookup instead (see resolveHost()).
+  bool have_cached_ip = !(_broker_ip == IPAddress((uint32_t)0));
+  if (!have_cached_ip) {
+    if (!resolveHost(host, _broker_ip)) {
+      _slot_state = "fail";
+      if (_outage_started_at == 0) _outage_started_at = now;
+      if (_backoff < 5) _backoff++;
+      ETH_MQTT_LOG("dns resolve failed for %s, backoff step %u", host, (unsigned)_backoff);
+      return false;
+    }
+  }
+  _client.setServer(_broker_ip, port);
   ETH_MQTT_LOG("connecting %s:%u as %s", host, (unsigned)port, _client_id);
   bool ok = user ? _client.connect(_client_id, user, pass) : _client.connect(_client_id);
   if (!ok) {
@@ -175,6 +219,10 @@ bool EthernetMQTTBridge::connectBroker(unsigned long now) {
     // (reconnectBackoffMs) saturates at index 5, so a plain clamp reproduces
     // the same delays without that extra state.
     if (_backoff < 5) _backoff++;
+    // A failed connect counts as a failed cache entry too: the broker may
+    // have moved (DHCP re-lease, DNS record change), so force a fresh
+    // resolveHost() on the next attempt instead of retrying a stale IP.
+    _broker_ip = IPAddress((uint32_t)0);
     ETH_MQTT_LOG("connect failed rc=%d, backoff step %u", _client.state(), (unsigned)_backoff);
     return false;
   }
@@ -182,10 +230,11 @@ bool EthernetMQTTBridge::connectBroker(unsigned long now) {
   _outage_started_at = 0;
   _backoff = 0;
   _slot_state = "ok";
-  _next_status_at = 0;
-  _next_link_at = 0;
-  _next_auth_at = 0;
-  if (!_time_synced) _next_ntp_at = 0;
+  // "fire immediately", wrap-safe: see refreshLink()'s comment.
+  _next_status_at = now;
+  _next_link_at = now;
+  _next_auth_at = now;
+  if (!_time_synced) _next_ntp_at = now;
   ETH_MQTT_LOG("connected");
   return true;
 }
@@ -200,12 +249,28 @@ void EthernetMQTTBridge::onDisconnected(unsigned long now) {
 bool EthernetMQTTBridge::syncNtp(uint32_t timeout_ms) {
   if (!_link_up) return false;
   const char* server = (_obs && _obs->mqtt_ntp_server[0]) ? _obs->mqtt_ntp_server : "pool.ntp.org";
+  // Resolve before opening the NTP UDP socket: NTPClient(udp, IPAddress) skips
+  // its own internal beginPacket(hostname, ...) DNS lookup entirely (it only
+  // does that when constructed with a `const char*` and _poolServerName is
+  // non-null; see NTPClient::sendNTPPacket() in NTPClient.cpp), so nothing
+  // else in this function can trigger the blocking hostname path.
+  if (!resolveHost(server, _ntp_ip)) {
+    ETH_MQTT_LOG("ntp dns failed for %s", server);
+    return false;
+  }
   EthernetUDP udp;                       // scoped: frees the W5100S socket on return
-  NTPClient ntp(udp, server);
+  NTPClient ntp(udp, _ntp_ip);
   ntp.begin();
   unsigned long start = millis();
+  // NTPClient::forceUpdate() waits up to ~1s internally per call (see
+  // NTPClient.cpp: up to 100 * 10ms delay iterations), so bound both the
+  // elapsed wall time AND the attempt count to timeout_ms / 1000 (at least
+  // one attempt), checking the deadline before every call.
+  uint32_t max_attempts = timeout_ms / 1000UL;
+  if (max_attempts < 1) max_attempts = 1;
   bool ok = false;
-  while (!ok && millis() - start < timeout_ms) {
+  for (uint32_t attempt = 0; attempt < max_attempts && !ok; attempt++) {
+    if (millis() - start >= timeout_ms) break;
     ok = ntp.forceUpdate();
   }
   if (ok) {
@@ -219,6 +284,7 @@ bool EthernetMQTTBridge::syncNtp(uint32_t timeout_ms) {
 }
 
 bool EthernetMQTTBridge::requestForcedNtpSync(uint32_t timeout_ms) {
+  if (timeout_ms > 5000UL) timeout_ms = 5000UL;   // cap regardless of caller's argument
   bool ok = syncNtp(timeout_ms);
   _next_ntp_at = millis() + 3600000UL;
   return ok;
@@ -235,9 +301,16 @@ bool EthernetMQTTBridge::ntpDiag(char* reply, size_t reply_size, bool verbose) {
 
 // ---- Step 4: status and link publishing ----
 
+// mallinfo().fordblks is free space *inside the arena newlib has already
+// carved from the heap* — not free RAM, since the arena only grows on demand
+// and never shrinks. dbgHeapTotal()/dbgHeapUsed() (declared in the Adafruit
+// nRF52 core's cores/nRF5/utility/debug.h, unconditionally — not gated behind
+// CFG_DEBUG — and pulled in transitively via MeshCore.h -> Arduino.h) report
+// the true heap ceiling (__HeapLimit - __HeapBase) and bytes actually
+// allocated (mallinfo().uordblks) respectively, so their difference is the
+// real free-RAM figure.
 static int freeHeapBytes() {
-  struct mallinfo mi = mallinfo();
-  return (int)mi.fordblks;
+  return dbgHeapTotal() - dbgHeapUsed();
 }
 
 bool EthernetMQTTBridge::publishStatus() {
@@ -384,4 +457,5 @@ void EthernetMQTTBridge::setSlotPreset(int slot_index, const char* preset_name) 
   _obs->mqtt_slot_preset[0][sizeof(_obs->mqtt_slot_preset[0]) - 1] = 0;
   if (_client.connected()) _client.disconnect();
   _backoff = 0; _last_connect_attempt = 0;
+  _broker_ip = IPAddress((uint32_t)0);   // preset/host may have changed; force re-resolve
 }
