@@ -6,6 +6,7 @@
 #include "MQTTWireScratch.h"
 #include <Mesh.h>
 #include <Timezone.h>
+#include <time.h>
 
 /**
  * @brief Utility class for building MQTT JSON messages
@@ -216,6 +217,19 @@ public:
     size_t buffer_size
   );
 
+  static int buildPacketJSONAt(
+    JsonDocument& doc,
+    mesh::Packet* packet,
+    bool is_tx,
+    const char* origin,
+    const char* origin_id,
+    Timezone* timezone,
+    time_t now_sec,
+    long now_usec,
+    char* buffer,
+    size_t buffer_size
+  );
+
   static int buildPacketJSONFromRaw(
     JsonDocument& doc,
     const uint8_t* raw_data,
@@ -228,6 +242,24 @@ public:
     float rssi,
     float score,
     Timezone* timezone,
+    char* buffer,
+    size_t buffer_size
+  );
+
+  static int buildPacketJSONFromRawAt(
+    JsonDocument& doc,
+    const uint8_t* raw_data,
+    int raw_len,
+    mesh::Packet* packet,
+    bool is_tx,
+    const char* origin,
+    const char* origin_id,
+    float snr,
+    float rssi,
+    float score,
+    Timezone* timezone,
+    time_t now_sec,
+    long now_usec,
     char* buffer,
     size_t buffer_size
   );
@@ -248,6 +280,18 @@ public:
     const char* origin,
     const char* origin_id,
     Timezone* timezone,
+    char* buffer,
+    size_t buffer_size
+  );
+
+  static int buildRawJSONAt(
+    JsonDocument& doc,
+    mesh::Packet* packet,
+    const char* origin,
+    const char* origin_id,
+    Timezone* timezone,
+    time_t now_sec,
+    long now_usec,
     char* buffer,
     size_t buffer_size
   );

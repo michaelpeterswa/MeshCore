@@ -158,16 +158,32 @@ int MQTTMessageBuilder::buildPacketJSON(
   char* buffer,
   size_t buffer_size
 ) {
-  if (!packet) return 0;
-  
-  // One wall-clock read: tv_sec feeds both the timestamp and the UTC time/date
-  // fields below (kept consistent), tv_usec is the real sub-second.
   struct timeval now_tv;
   gettimeofday(&now_tv, nullptr);
-  time_t now = now_tv.tv_sec;
+  return buildPacketJSONAt(doc, packet, is_tx, origin, origin_id, timezone,
+                            now_tv.tv_sec, now_tv.tv_usec, buffer, buffer_size);
+}
+
+int MQTTMessageBuilder::buildPacketJSONAt(
+  JsonDocument& doc,
+  mesh::Packet* packet,
+  bool is_tx,
+  const char* origin,
+  const char* origin_id,
+  Timezone* timezone,
+  time_t now_sec,
+  long now_usec,
+  char* buffer,
+  size_t buffer_size
+) {
+  if (!packet) return 0;
+
+  // One wall-clock read: tv_sec feeds both the timestamp and the UTC time/date
+  // fields below (kept consistent), tv_usec is the real sub-second.
+  time_t now = now_sec;
   char timestamp[40];
-  formatIsoTimestampForMqtt(now, now_tv.tv_usec, timezone, timestamp, sizeof(timestamp));
-  
+  formatIsoTimestampForMqtt(now, now_usec, timezone, timestamp, sizeof(timestamp));
+
   // Packet time/date: UTC (gmtime), same family as meshcoretomqtt serial fields
   struct tm* utc_timeinfo = gmtime(&now);
   
@@ -235,16 +251,38 @@ int MQTTMessageBuilder::buildPacketJSONFromRaw(
   char* buffer,
   size_t buffer_size
 ) {
-  if (!packet || !raw_data || raw_len <= 0) return 0;
-  
-  // One wall-clock read: tv_sec feeds both the timestamp and the UTC time/date
-  // fields below (kept consistent), tv_usec is the real sub-second.
   struct timeval now_tv;
   gettimeofday(&now_tv, nullptr);
-  time_t now = now_tv.tv_sec;
+  return buildPacketJSONFromRawAt(doc, raw_data, raw_len, packet, is_tx, origin, origin_id,
+                                  snr, rssi, score, timezone, now_tv.tv_sec, now_tv.tv_usec,
+                                  buffer, buffer_size);
+}
+
+int MQTTMessageBuilder::buildPacketJSONFromRawAt(
+  JsonDocument& doc,
+  const uint8_t* raw_data,
+  int raw_len,
+  mesh::Packet* packet,
+  bool is_tx,
+  const char* origin,
+  const char* origin_id,
+  float snr,
+  float rssi,
+  float score,
+  Timezone* timezone,
+  time_t now_sec,
+  long now_usec,
+  char* buffer,
+  size_t buffer_size
+) {
+  if (!packet || !raw_data || raw_len <= 0) return 0;
+
+  // One wall-clock read: tv_sec feeds both the timestamp and the UTC time/date
+  // fields below (kept consistent), tv_usec is the real sub-second.
+  time_t now = now_sec;
   char timestamp[40];
-  formatIsoTimestampForMqtt(now, now_tv.tv_usec, timezone, timestamp, sizeof(timestamp));
-  
+  formatIsoTimestampForMqtt(now, now_usec, timezone, timestamp, sizeof(timestamp));
+
   struct tm* utc_timeinfo = gmtime(&now);
   
   // Format time and date (ALWAYS UTC)
@@ -306,13 +344,28 @@ int MQTTMessageBuilder::buildRawJSON(
   char* buffer,
   size_t buffer_size
 ) {
+  struct timeval now_tv;
+  gettimeofday(&now_tv, nullptr);
+  return buildRawJSONAt(doc, packet, origin, origin_id, timezone,
+                         now_tv.tv_sec, now_tv.tv_usec, buffer, buffer_size);
+}
+
+int MQTTMessageBuilder::buildRawJSONAt(
+  JsonDocument& doc,
+  mesh::Packet* packet,
+  const char* origin,
+  const char* origin_id,
+  Timezone* timezone,
+  time_t now_sec,
+  long now_usec,
+  char* buffer,
+  size_t buffer_size
+) {
   if (!packet) return 0;
 
   // One wall-clock read: tv_sec for the timestamp, tv_usec for the real sub-second.
-  struct timeval now_tv;
-  gettimeofday(&now_tv, nullptr);
   char timestamp[40];
-  formatIsoTimestampForMqtt(now_tv.tv_sec, now_tv.tv_usec, timezone, timestamp, sizeof(timestamp));
+  formatIsoTimestampForMqtt(now_sec, now_usec, timezone, timestamp, sizeof(timestamp));
 
   // Convert packet to hex
   char raw_hex[WIRE_HEX_SCRATCH_SIZE];
