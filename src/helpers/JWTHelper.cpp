@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <SHA256.h>
 #include <string.h>
+#include <time.h>
 #include "ed_25519.h"
 #if defined(ESP_PLATFORM)
 #include "mbedtls/base64.h"

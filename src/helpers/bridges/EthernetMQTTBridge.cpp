@@ -25,9 +25,11 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
     _next_status_at(0), _next_ntp_at(0), _next_neighbors_at(0), _next_link_at(0), _next_auth_at(0),
     _staged_raw_len(0), _staged_snr(0), _staged_rssi(0), _staged_valid(false),
     _packet_retry_pending(false), _event_retry_pending(false),
-    _front_packets_done(false), _front_raw_done(false) {
+    _front_packets_done(false), _front_raw_done(false), _auth_count(0) {
   _device_id[0] = _firmware_version[0] = _board_model[0] = _build_date[0] = 0;
   _origin[0] = _iata[0] = _client_id[0] = 0;
+  memset(_auth_issued_at, 0, sizeof(_auth_issued_at));
+  memset(_auth_audiences, 0, sizeof(_auth_audiences));
   s_instance = this;
 }
 
@@ -79,7 +81,14 @@ void EthernetMQTTBridge::setStatsSources(mesh::Dispatcher* d, mesh::Radio* r, me
   _dispatcher = d; _radio = r; _board = b; _ms = ms;
 }
 int EthernetMQTTBridge::getQueueSize() const { return (int)(_packet_ring.size() + _event_ring.size()); }
-void EthernetMQTTBridge::requestPublishNeighbors(const char*, size_t) {}
+
+void EthernetMQTTBridge::requestPublishNeighbors(const char* json, size_t len) {
+  // Compatibility with the ESP32 path: publish caller-built JSON directly.
+  char topic[128];
+  if (!json || len == 0 || !topicFor("neighbors", topic, sizeof(topic))) return;
+  bool ok = _client.publish(topic, (const uint8_t*)json, len, false);
+  ok ? _publish_ok++ : _publish_err++;
+}
 
 void EthernetMQTTBridge::getEffectiveMqttOrigin(const NodePrefs* np, const MQTTPrefs* obs, char* buf, size_t buf_size) {
   const char* src = (obs && obs->mqtt_origin[0]) ? obs->mqtt_origin : (np ? np->node_name : "");
@@ -100,8 +109,52 @@ bool EthernetMQTTBridge::publishRoomTopic(const char* suffix, const char* json, 
   return true;
 }
 
-bool EthernetMQTTBridge::publishNeighbors() { return false; }
-bool EthernetMQTTBridge::publishAuthTokens() { return false; }
+bool EthernetMQTTBridge::publishNeighbors() {
+  if (!_neighbor_source) return false;
+  char topic[128];
+  if (!topicFor("neighbors", topic, sizeof(topic))) return false;
+  MQTTPayloadBuilder::NeighborsMessageEntry entries[NEIGHBORS_MAX_PUBLISH_ENTRIES];
+  static char hex_pool[NEIGHBORS_MAX_PUBLISH_ENTRIES * (PUB_KEY_SIZE * 2 + 1)];
+  uint32_t now = _rtc->getCurrentTime();
+  int n = _neighbor_source->collectNeighbors(entries, NEIGHBORS_MAX_PUBLISH_ENTRIES, hex_pool, sizeof(hex_pool), now);
+  char timestamp[40]; formatTimestamp(timestamp, sizeof(timestamp));
+  int len = MQTTPayloadBuilder::buildNeighborsMessage(_doc, _origin, _device_id, timestamp, "", "",
+                                                      entries, n, _json, sizeof(_json), n, 0, false);
+  if (len <= 0) return false;
+  bool ok = _client.publish(topic, (const uint8_t*)_json, len, false);
+  ok ? _publish_ok++ : _publish_err++;
+  return ok;
+}
+
+bool EthernetMQTTBridge::publishAuthTokens() {
+  if (!_eth || !_identity) return false;
+  _auth_count = MQTTEthernetPolicy::parseAudiences(_eth->auth_audiences, _auth_audiences, 4);
+  if (_auth_count == 0 || !_time_synced) return false;
+  uint32_t now = _rtc->getCurrentTime();
+  uint32_t life = _eth->auth_life_secs ? _eth->auth_life_secs : 3300;
+  for (int i = 0; i < _auth_count; i++) {
+    if (!MQTTEthernetPolicy::tokenRenewalDue(now, _auth_issued_at[i], life)) continue;
+    static char token[600];
+    if (!JWTHelper::createAuthToken(*_identity, _auth_audiences[i], now, life, token, sizeof(token),
+                                    _obs->mqtt_owner_public_key[0] ? _obs->mqtt_owner_public_key : nullptr,
+                                    "meshcore-nrf52-eth",
+                                    _obs->mqtt_email[0] ? _obs->mqtt_email : nullptr)) {
+      ETH_MQTT_LOG("jwt failed for %s", _auth_audiences[i]);
+      continue;
+    }
+    char suffix[80]; snprintf(suffix, sizeof(suffix), "auth/%s", _auth_audiences[i]);
+    char topic[160];
+    if (!topicFor(suffix, topic, sizeof(topic))) continue;
+    int len = MQTTEthernetPayloads::buildAuthMessage(_doc, _auth_audiences[i], _device_id, token, now, now + life, _json, sizeof(_json));
+    if (len <= 0) continue;
+    bool ok = _client.publish(topic, (const uint8_t*)_json, len, true);
+    ok ? _publish_ok++ : _publish_err++;
+    if (ok) _auth_issued_at[i] = now;
+    return true;   // one token per pass
+  }
+  return false;
+}
+
 bool EthernetMQTTBridge::drainPacketRing() {
   PacketEntry* e = _packet_ring.front();
   if (!e) return false;

@@ -114,6 +114,9 @@ struct NeighbourInfo {
 };
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  , public EthernetMQTTBridge::NeighborSource
+#endif
 #ifdef WITH_WEBCONFIG
     , public WebConfigServer::Callbacks
 #endif
@@ -216,6 +219,17 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
   void applyRoomLogFlags();
   // Copies cmd into out, replacing the argument of secret-bearing commands with "<redacted>".
   static void redactAdminCommand(const char* cmd, char* out, size_t out_size);
+
+  // Passive neighbour cache for EthernetMQTTBridge::NeighborSource. Unlike the
+  // ESP32 WITH_MQTT_NEIGHBORS path (active node-discover requests, gated by
+  // PSRAM availability), this only tracks zero-hop repeater adverts heard over
+  // the air -- sufficient for the "heard" entries the neighbors topic reports.
+  NeighbourInfo neighbours[MAX_NEIGHBOURS];
+  void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+  void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
+                    const uint8_t* app_data, size_t app_data_len) override;
+  int collectNeighbors(MQTTPayloadBuilder::NeighborsMessageEntry* out, int max_entries,
+                       char* hex_pool, size_t hex_pool_size, uint32_t now_secs) override;
 #endif
 #ifdef WITH_SNMP
   MeshSNMPAgent _snmp_agent;

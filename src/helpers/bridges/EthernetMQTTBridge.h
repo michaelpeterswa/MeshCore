@@ -191,6 +191,11 @@ private:
   JsonDocument _doc;
   char _json[1024];
 
+  // Auth token state: up to 4 audiences parsed from _eth->auth_audiences.
+  uint32_t _auth_issued_at[4];
+  char _auth_audiences[4][64];
+  int _auth_count;
+
   static EthernetMQTTBridge* s_instance;
 
   bool linkReady() const;

@@ -452,6 +452,69 @@ void MyMesh::redactAdminCommand(const char* cmd, char* out, size_t out_size) {
     out[n] = 0;
   }
 }
+
+// Passive neighbour cache (see the header comment on `neighbours`): find the
+// existing slot for `id`, else reuse the least recently updated one.
+void MyMesh::putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr) {
+  uint32_t oldest_timestamp = 0xFFFFFFFF;
+  NeighbourInfo* neighbour = &neighbours[0];
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (id.matches(neighbours[i].id)) {
+      neighbour = &neighbours[i];
+      break;
+    }
+    if (neighbours[i].heard_timestamp < oldest_timestamp) {
+      neighbour = &neighbours[i];
+      oldest_timestamp = neighbour->heard_timestamp;
+    }
+  }
+  neighbour->id = id;
+  neighbour->advert_timestamp = timestamp;
+  neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
+  neighbour->snr = (int8_t)(snr * 4);
+}
+
+static bool ethBridgeIsShareAdvert(const mesh::Packet* packet) {
+  if (packet->hasTransportCodes()) {
+    return packet->transport_codes[0] == 0 && packet->transport_codes[1] == 0;  // { 0, 0 } means 'send to nowhere'
+  }
+  return false;
+}
+
+void MyMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
+                          const uint8_t* app_data, size_t app_data_len) {
+  mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len); // chain to super impl
+
+  // Only zero-hop repeater adverts (not relayed via 'Share') count as directly heard.
+  if (packet->getPathHashCount() == 0 && !ethBridgeIsShareAdvert(packet)) {
+    AdvertDataParser parser(app_data, app_data_len);
+    if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) {
+      putNeighbour(id, timestamp, packet->getSNR());
+    }
+  }
+}
+
+int MyMesh::collectNeighbors(MQTTPayloadBuilder::NeighborsMessageEntry* out, int max_entries,
+                             char* hex_pool, size_t hex_pool_size, uint32_t now_secs) {
+  const size_t hex_size = PUB_KEY_SIZE * 2 + 1;
+  int n = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS && n < max_entries; i++) {
+    NeighbourInfo& nb = neighbours[i];
+    if (nb.heard_timestamp == 0) continue;
+    if ((size_t)(n + 1) * hex_size > hex_pool_size) break;
+    char* hex = hex_pool + n * hex_size;
+    mesh::Utils::toHex(hex, nb.id.pub_key, PUB_KEY_SIZE);
+    out[n].pubkey_hex = hex;
+    out[n].snr = nb.snr / 4.0f;
+    bool known = now_secs >= nb.heard_timestamp;
+    out[n].heard_unknown = !known;
+    out[n].heard_secs_ago = known ? (now_secs - nb.heard_timestamp) : 0;
+    out[n].scopes = "";
+    out[n].status = "heard";
+    n++;
+  }
+  return n;
+}
 #endif
 
 uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
@@ -1072,6 +1135,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   neighbor_discover_origin[0] = 0;
   memset(neighbours, 0, sizeof(neighbours));
 #endif
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  memset(neighbours, 0, sizeof(neighbours));
+#endif
 
   memset(default_scope.key, 0, sizeof(default_scope.key));
 }
@@ -1146,6 +1212,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #ifdef WITH_MQTT_BRIDGE_ETHERNET
       EthernetObserverPrefsStore::load(_fs, &ethernetObserverPrefs());
       bridge->setEthernetPrefs(&ethernetObserverPrefs());
+      bridge->setNeighborSource(this);
       _room_log.setSink(roomLogSink, this);
       _room_log.setOrigin(_prefs.node_name, _device_id_hex);
       applyRoomLogFlags();
