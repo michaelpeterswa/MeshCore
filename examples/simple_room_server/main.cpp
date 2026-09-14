@@ -89,6 +89,15 @@ void setup() {
 
   the_mesh.begin(fs);
 
+#if defined(ETHERNET_ENABLED) && defined(WITH_MQTT_BRIDGE_ETHERNET)
+  // ethernet_task (DHCP, on Core/priority 1 alongside this loop task) and the
+  // bridge both touch the RAK13800 over the same SPI bus, which the vendor
+  // library never locks. Hand the bridge the address of ethernet_running so
+  // it never calls Ethernet.linkStatus()/localIP() until DHCP reports a
+  // lease (C1).
+  the_mesh.setEthernetReadyFlag(&ethernet_running);
+#endif
+
 #ifdef DISPLAY_CLASS
   if (display_ready) {
     ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);

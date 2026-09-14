@@ -36,6 +36,11 @@
 #include "helpers/RoomLogPublisher.h"
 #include "helpers/EthernetObserverPrefs.h"
 #include "helpers/MQTTMessageBuilder.h"
+#include "helpers/MQTTEthernetPolicy.h"
+#endif
+
+#if defined(WITH_MQTT_BRIDGE_ETHERNET) && defined(WITH_MQTT_NEIGHBORS)
+#error "WITH_MQTT_BRIDGE_ETHERNET and WITH_MQTT_NEIGHBORS both declare the neighbours table"
 #endif
 
 #ifdef WITH_SNMP
@@ -212,13 +217,25 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
 #ifdef WITH_MQTT_BRIDGE_ETHERNET
   RoomLogPublisher _room_log;
   unsigned long _next_room_stats_at = 0;
+  // Effective MQTT origin (mqtt.origin if set, else node_name), computed once
+  // by wireEthernetBridge() and shared with the bridge's own origin so room
+  // topics and observer topics agree.
+  char _room_origin[32];
+  // Gate pointer for EthernetMQTTBridge::setLinkGate(), stored here so a
+  // bridge constructed later (setBridgeState) also gets wired to it; see
+  // setEthernetReadyFlag().
+  const volatile bool* _ethernet_ready_flag = nullptr;
   static bool roomLogSink(void* ctx, const char* suffix, const char* json, size_t len, bool retain);
   void roomLogTimestamp(char* buf, size_t buf_size);
   void logRoomEvent(const char* event, const uint8_t* actor, const char* result, const char* detail);
   void publishRoomStats();
   void applyRoomLogFlags();
-  // Copies cmd into out, replacing the argument of secret-bearing commands with "<redacted>".
-  static void redactAdminCommand(const char* cmd, char* out, size_t out_size);
+  // Wires a freshly-constructed bridge to the ethernet prefs, neighbour
+  // source, link gate, and room-log sink/origin. Called from begin() and
+  // from setBridgeState() right after the bridge is constructed (or before
+  // begin() is called on it) so both paths end up fully wired. Requires
+  // _device_id_hex to already be filled in.
+  void wireEthernetBridge();
 
   // Passive neighbour cache for EthernetMQTTBridge::NeighborSource. Unlike the
   // ESP32 WITH_MQTT_NEIGHBORS path (active node-discover requests, gated by
@@ -385,6 +402,12 @@ public:
       mesh::LocalIdentity self_id = getSelfId();
       mesh::Utils::toHex(device_id, self_id.pub_key, PUB_KEY_SIZE);
       bridge->setDeviceID(device_id);
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+      // wireEthernetBridge() needs _device_id_hex filled before it calls
+      // _room_log.setOrigin().
+      strncpy(_device_id_hex, device_id, sizeof(_device_id_hex) - 1);
+      _device_id_hex[sizeof(_device_id_hex) - 1] = 0;
+#endif
       bridge->setFirmwareVersion(getFirmwareVer());
       bridge->setBoardModel(_cli.getBoard()->getManufacturerName());
       bridge->setBuildDate(getBuildDate());
@@ -397,6 +420,9 @@ public:
         bridge->setSNMPAgent(&_snmp_agent);
       }
 #endif
+#endif
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+      wireEthernetBridge();
 #endif
       bridge->begin();
 #ifdef WITH_MQTT_BRIDGE
@@ -493,6 +519,17 @@ public:
     if (!bridge || !bridge->isRunning()) return false;
     return bridge->ntpDiag(reply, reply_size, verbose);
   }
+
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  // Called once from main.cpp right after begin(), with the address of the
+  // ethernet_task's header-scope `ethernet_running` flag. Stored so a bridge
+  // constructed later (setBridgeState) is wired too; forwarded immediately
+  // when the bridge already exists (the begin()-time bridge, in practice).
+  void setEthernetReadyFlag(const volatile bool* f) {
+    _ethernet_ready_flag = f;
+    if (bridge) bridge->setLinkGate(f);
+  }
+#endif
 #endif
 
 #ifdef WITH_WEBCONFIG
