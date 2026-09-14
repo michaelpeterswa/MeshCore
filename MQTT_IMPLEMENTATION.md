@@ -228,6 +228,16 @@ management is bound to the WiFi station API, so the observer envs uplink over Wi
 See `UPSTREAM_BUGS.md` for the Ethernet gap. The board has PSRAM, so these builds
 get neighbors publication (`WITH_MQTT_NEIGHBORS`) automatically.
 
+**RAK4631 + RAK13800 (WisMesh Ethernet Gateway) — Ethernet, plain MQTT only:**
+`RAK_4631_room_server_observer_mqtt_ethernet` uses `EthernetMQTTBridge`, a
+separate nRF52 implementation behind the `MQTTBridge` alias in
+`src/helpers/bridges/MQTTBridge.h`. It publishes the same `status`, `packets`,
+`raw`, and `neighbors` JSON, plus room log topics, but has no TLS; WSS and
+mqtts presets are rejected with a pointer to the LAN proxy. QoS is 0
+everywhere (PubSubClient), and the nRF52-only settings persist in their own
+`/mqtt_eth_prefs` file, separate from the shared `/mqtt_prefs` file. See
+`docs/cli_commands.md` for the CLI subset.
+
 **TLora naming:** The env prefix `LilyGo_TLora_V2_1_1_6` is LilyGo’s **T-LoRa V2.1–1.6** board (SX1276); PlatformIO selects **`ttgo-lora32-v1`** (TTGO LoRa32 V1.0). **MQTT observer** envs extend a slim base **without** `sensor_base` so the image fits `min_spiffs`; **all other** `LilyGo_TLora_V2_1_1_6_*` targets still use optional I2C environmental sensors as before. The **`lilygo_tlora_c6`** variant is separate hardware (ESP32-C6).
 
 **T-LoRa V2.1–1.6 MQTT observer — one WSS broker:** This hardware is **classic ESP32 without PSRAM**. Each WSS preset uses a full TLS stack and large contiguous heap allocations; **two active broker presets at once** typically fails the second connection (`mbedtls_ssl_setup` / `esp-tls` `0x8017`, low `IntMax` in `memory`). **Treat these observer builds as supporting one active cloud preset:** configure the broker you need in `mqtt1` or `mqtt2`, and set the other slot to `none` (e.g. `set mqtt2.preset none`). Use PSRAM-capable boards if you need multiple simultaneous MQTT uplinks.

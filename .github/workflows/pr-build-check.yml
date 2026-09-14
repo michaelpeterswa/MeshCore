@@ -57,6 +57,7 @@ jobs:
           - RAK_4631_repeater_ethernet
           - RAK_4631_room_server
           - RAK_4631_room_server_ethernet
+          - RAK_4631_room_server_observer_mqtt_ethernet
           # RP2040
           - PicoW_repeater
           # STM32

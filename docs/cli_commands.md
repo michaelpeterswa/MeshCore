@@ -1301,6 +1301,34 @@ Ethernet support is available on RAK4631 boards with a RAK13800 (W5100S) Etherne
 
 ---
 
+#### MQTT observer over Ethernet (RAK4631 + RAK13800)
+
+The `RAK_4631_room_server_observer_mqtt_ethernet` firmware publishes the observer topics (`status`, `packets`, `raw`, `neighbors`) plus a room log (`room/posts`, `room/events`, `room/dm`, `room/stats`), Ethernet `link` status, and device-signed analyzer tokens (`auth/{audience}`) to a plain MQTT broker on the LAN. TLS and the public analyzers are reached through a LAN proxy, not from the device.
+
+Supported settings: `mqtt.iata`, `mqtt.origin`, `mqtt.owner`, `mqtt.email`, `mqtt.ntp`, `mqtt.interval`, `mqtt.status`, `mqtt.packets`, `mqtt.raw`, `mqtt.rx`, `mqtt.tx`, `mqtt.neighbors`, `mqtt.neighbors.interval`, `mqtt1.preset`, `mqtt1.server`, `mqtt1.port`, `mqtt1.username`, `mqtt1.password` (serial or telnet only).
+
+`mqtt.interval` (minutes, 1–60) and `mqtt.neighbors.interval` (hours, 12–336) use the same units as the ESP32 observer build (`CommonCLI_Observer.cpp`) — not seconds — and both restart the bridge when set, same as on the ESP32 build.
+
+New settings: `mqtt.room.posts`, `mqtt.room.events`, `mqtt.room.dm`, `mqtt.room.stats` (all default on); `mqtt.auth.aud` (comma-separated analyzer audiences, default empty — each audience is placed directly into an MQTT topic segment, so `+`, `#`, and control characters are rejected); `mqtt.auth.life` (token lifetime in seconds, 300–86400, default 3300, renewed once two thirds of the lifetime has elapsed).
+
+Not available on this build: `wifi.*`, `snmp.*`, `alert.*`, `mqtt.analyzer.*`, `mqtt2` and above, `ota`, `webconfig`, `tls.bundletest`. `mqtt1.preset` only accepts presets with an `mqtt://` URL; `get mqtt.presets` lists them.
+
+**`get mqtt.status` reply:** `> MQTT: <state> link=<up|down> broker=<host>:<port> ok=<n> err=<n> q=<n> drops=<pkt>/<evt> ntp=<0|1>` — `<state>` is one of `inactive`, `wait`, `ok`, `fail`, `disc`; `drops` is packets/events dropped from the two rings described below; `ntp` is `1` once the RTC has completed a successful time sync.
+
+`status` carries the usual observer fields plus an extra `time_synced` boolean; its `internal_heap` value comes from the Adafruit nRF52 core's `dbgHeapFree()` rather than an ESP32 heap-caps call.
+
+**Admin command redaction:** commands echoed to `room/dm` and `room/events` are redacted before publish — a command whose first token is `password`, or a `set` whose key contains `password`, `prv.key`, or `psk` (case-insensitively), has everything after the key replaced with `<redacted>`.
+
+**`room/stats` caveat:** `posts_unsynced` counts posts in the local ring newer than 24 hours; it is not true per-client sync state. No client name is ever published — `author_name`/`actor_name` are not present in any payload, since the ACL stores no names.
+
+**DNS and broker choice:** the broker and NTP server hostnames are resolved with a DNS lookup bounded to about 1 second (three 334 ms attempts); a dotted-quad address skips DNS entirely. A hostname broker therefore stalls the main loop for up to a second on every connect attempt while DNS is unreachable — prefer an IP address for the local broker.
+
+**Settings storage:** the nRF52-only settings (`mqtt.room.*`, `mqtt.auth.*`) persist in their own `/mqtt_eth_prefs` file, separate from the shared `/mqtt_prefs` file used by `mqtt.iata`, `mqtt1.*`, and the other settings above.
+
+Notes: PubSubClient publishes at QoS 0 everywhere; retained topics are `status`, `room/stats`, `link`, and `auth/*`. Room posts report the room's own timestamp as `client_timestamp`. Reconnect backoff steps through 10 s, 30 s, 60 s, 120 s, then caps at 300 s. Packets are held in a 16-entry ring and room events in an 8-entry ring while the broker is unreachable; each ring retries once and then drops the oldest entry, counting the drop in `room/stats`.
+
+---
+
 #### View Ethernet connection status
 **Usage:**
 - `eth.status`
