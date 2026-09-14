@@ -96,7 +96,14 @@ bool EthernetMQTTBridge::resolveHost(const char* host, IPAddress& out) const {
   if (out.fromString(host)) return true;   // dotted-quad literal: no DNS needed
   DNSClient dns;
   dns.begin(Ethernet.dnsServerIP());
-  int rc = dns.getHostByName(host, out, 1000);
+  // getHostByName()'s `timeout` argument is a PER-ATTEMPT wait, not a total
+  // budget: on no response it retries ProcessResponse(timeout) up to 3 times
+  // internally before giving up (RAK13800-W5100S/src/Dns.cpp:106-124). Passing
+  // 1000 here would let a single call block up to ~3s. 334ms keeps the worst
+  // case (3 * 334ms ~= 1s) near the ~1s bound documented on the header
+  // declaration — do not "round this up" to 1000 without re-deriving that
+  // budget against the x3 multiplier.
+  int rc = dns.getHostByName(host, out, 334);
   return rc == 1;
 }
 
@@ -249,6 +256,11 @@ void EthernetMQTTBridge::onDisconnected(unsigned long now) {
 bool EthernetMQTTBridge::syncNtp(uint32_t timeout_ms) {
   if (!_link_up) return false;
   const char* server = (_obs && _obs->mqtt_ntp_server[0]) ? _obs->mqtt_ntp_server : "pool.ntp.org";
+  // Start the deadline clock BEFORE resolving: resolveHost() itself can block
+  // (up to ~1s; see its own comment), and that time must count against
+  // timeout_ms, not be added on top of it, or syncNtp(2000) could really take
+  // ~3s end to end.
+  unsigned long start = millis();
   // Resolve before opening the NTP UDP socket: NTPClient(udp, IPAddress) skips
   // its own internal beginPacket(hostname, ...) DNS lookup entirely (it only
   // does that when constructed with a `const char*` and _poolServerName is
@@ -258,19 +270,24 @@ bool EthernetMQTTBridge::syncNtp(uint32_t timeout_ms) {
     ETH_MQTT_LOG("ntp dns failed for %s", server);
     return false;
   }
+  if ((unsigned long)(millis() - start) >= timeout_ms) {
+    // DNS alone ate the whole budget; do not even open the UDP socket.
+    ETH_MQTT_LOG("ntp dns for %s used the full %lu ms budget", server, (unsigned long)timeout_ms);
+    return false;
+  }
   EthernetUDP udp;                       // scoped: frees the W5100S socket on return
   NTPClient ntp(udp, _ntp_ip);
   ntp.begin();
-  unsigned long start = millis();
   // NTPClient::forceUpdate() waits up to ~1s internally per call (see
   // NTPClient.cpp: up to 100 * 10ms delay iterations), so bound both the
-  // elapsed wall time AND the attempt count to timeout_ms / 1000 (at least
-  // one attempt), checking the deadline before every call.
+  // elapsed wall time (measured from `start`, i.e. including the DNS lookup
+  // above) AND the attempt count to timeout_ms / 1000 (at least one attempt),
+  // checking the deadline before every call.
   uint32_t max_attempts = timeout_ms / 1000UL;
   if (max_attempts < 1) max_attempts = 1;
   bool ok = false;
   for (uint32_t attempt = 0; attempt < max_attempts && !ok; attempt++) {
-    if (millis() - start >= timeout_ms) break;
+    if ((unsigned long)(millis() - start) >= timeout_ms) break;
     ok = ntp.forceUpdate();
   }
   if (ok) {
@@ -303,14 +320,14 @@ bool EthernetMQTTBridge::ntpDiag(char* reply, size_t reply_size, bool verbose) {
 
 // mallinfo().fordblks is free space *inside the arena newlib has already
 // carved from the heap* — not free RAM, since the arena only grows on demand
-// and never shrinks. dbgHeapTotal()/dbgHeapUsed() (declared in the Adafruit
-// nRF52 core's cores/nRF5/utility/debug.h, unconditionally — not gated behind
-// CFG_DEBUG — and pulled in transitively via MeshCore.h -> Arduino.h) report
-// the true heap ceiling (__HeapLimit - __HeapBase) and bytes actually
-// allocated (mallinfo().uordblks) respectively, so their difference is the
-// real free-RAM figure.
+// and never shrinks. The Adafruit nRF52 core's cores/nRF5/utility/debug.h
+// (declared unconditionally — not gated behind CFG_DEBUG — and pulled in
+// transitively via MeshCore.h -> Arduino.h) provides dbgHeapFree(), a static
+// inline already computing dbgHeapTotal() - dbgHeapUsed() (true heap ceiling
+// __HeapLimit - __HeapBase minus bytes actually allocated, mallinfo().uordblks;
+// see debug.h:58-61), which is the real free-RAM figure.
 static int freeHeapBytes() {
-  return dbgHeapTotal() - dbgHeapUsed();
+  return dbgHeapFree();
 }
 
 bool EthernetMQTTBridge::publishStatus() {

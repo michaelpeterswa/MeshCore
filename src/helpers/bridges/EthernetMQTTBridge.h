@@ -189,7 +189,9 @@ private:
   bool linkReady() const;
   void refreshLink(unsigned long now);
   // Resolves a dotted-quad literal instantly via IPAddress::fromString(), else
-  // does a single DNSClient::getHostByName() with a bounded 1000ms timeout.
+  // does a single DNSClient::getHostByName() with a ~1s-bounded timeout (see
+  // the .cpp: getHostByName's `timeout` arg is per-attempt and it retries up
+  // to 3x internally, so the passed timeout is well under 1000ms).
   // Never pass `host` on to connect()/beginPacket() directly.
   bool resolveHost(const char* host, IPAddress& out) const;
   bool connectBroker(unsigned long now);
