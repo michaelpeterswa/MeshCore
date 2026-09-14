@@ -75,6 +75,16 @@ void MyMesh::storePost(const mesh::Identity &author, const char *postData) {
   next_push = futureMillis(PUSH_NOTIFY_DELAY_MILLIS);
   _num_posted++; // stats
   MESH_DEBUG_PRINTLN("room.post: next_post_idx=%d num_posted=%d push scheduled", next_post_idx, _num_posted);
+
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  {
+    ClientInfo* c = acl.getClient(author.pub_key, PUB_KEY_SIZE);
+    uint8_t perms = c ? c->permissions : PERM_ACL_ADMIN;   // system posts come from self_id
+    char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+    RoomLogPublisher::Post p = { author.pub_key, perms, posts[idx].text, posts[idx].post_timestamp };
+    _room_log.publishPost(p, ts);
+  }
+#endif
 }
 
 void MyMesh::pushPostToClient(ClientInfo *client, PostInfo &post) {
@@ -343,6 +353,48 @@ const char *MyMesh::getLogDateTime() {
   return tmp;
 }
 
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+bool MyMesh::roomLogSink(void* ctx, const char* suffix, const char* json, size_t len, bool retain) {
+  MyMesh* self = (MyMesh*)ctx;
+  return self->bridge && self->_prefs.bridge_enabled && self->bridge->publishRoomTopic(suffix, json, len, retain);
+}
+
+void MyMesh::roomLogTimestamp(char* buf, size_t buf_size) {
+  MQTTMessageBuilder::formatIsoTimestampForMqtt((time_t)getRTCClock()->getCurrentTime(),
+                                                (long)((_ms->getMillis() % 1000UL) * 1000UL), nullptr, buf, buf_size);
+}
+
+void MyMesh::logRoomEvent(const char* event, const uint8_t* actor, const char* result, const char* detail) {
+  char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+  RoomLogPublisher::Event e = { event, actor, result, detail };
+  _room_log.publishEvent(e, ts);
+}
+
+void MyMesh::applyRoomLogFlags() {
+  EthernetObserverPrefs& eth = ethernetObserverPrefs();
+  _room_log.setEnabled(eth.room_posts, eth.room_events, eth.room_dm, eth.room_stats);
+}
+
+void MyMesh::publishRoomStats() {
+  RoomLogPublisher::Stats s = {};
+  s.posts_total = _num_posted;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  for (int i = 0; i < MAX_UNSYNCED_POSTS; i++) if (posts[i].post_timestamp && now < posts[i].post_timestamp + 86400UL) s.posts_unsynced++;
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    switch (acl.getClientByIdx(i)->permissions & PERM_ACL_ROLE_MASK) {
+      case PERM_ACL_ADMIN: s.clients_admin++; break;
+      case PERM_ACL_READ_WRITE: s.clients_read_write++; break;
+      case PERM_ACL_READ_ONLY: s.clients_read_only++; break;
+      default: s.clients_guest++; break;
+    }
+  }
+  if (_fs->exists("/s_contacts")) { File f = _fs->open("/s_contacts"); if (f) { s.acl_bytes = f.size(); f.close(); } }
+  if (bridge) { s.packet_drops = bridge->packetDrops(); s.event_drops = bridge->eventDrops(); }
+  char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+  _room_log.publishStats(s, ts);
+}
+#endif
+
 uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
   uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * _prefs.tx_delay_factor);
   return getRNG()->nextInt(0, 5*t + 1);
@@ -406,6 +458,9 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
           perm = PERM_ACL_GUEST;
         } else {
           MESH_DEBUG_PRINTLN("Incorrect room password");
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+          logRoomEvent("login_fail", sender.pub_key, "bad_password", "");
+#endif
           return; // no response. Client will timeout
         }
       }
@@ -413,10 +468,16 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
       client = acl.putClient(sender, 0);  // add to known clients (if not already known)
       if (sender_timestamp <= client->last_timestamp) {
         MESH_DEBUG_PRINTLN("possible replay attack!");
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+        logRoomEvent("login_fail", sender.pub_key, "replay", "");
+#endif
         return;
       }
 
       MESH_DEBUG_PRINTLN("Login success!");
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+      logRoomEvent("login_ok", sender.pub_key, "ok", RoomLogPublisher::roleName(perm));
+#endif
       client->last_timestamp = sender_timestamp;
       client->extra.room.sync_since = sender_sync_since;
       client->extra.room.pending_ack = 0;
@@ -569,16 +630,38 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
           if (is_retry) {
             temp[5] = 0; // no reply
           } else {
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+            {
+              char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+              RoomLogPublisher::DirectMessage m = { client->id.pub_key, client->permissions, "cli_data", true, (const char*)&data[5], sender_timestamp };
+              _room_log.publishDirectMessage(m, ts);
+              logRoomEvent("admin_cmd", client->id.pub_key, "ok", (const char*)&data[5]);
+            }
+#endif
             handleCommand(sender_timestamp, (char *)&data[5], (char *)&temp[5]);
             temp[4] = (TXT_TYPE_CLI_DATA << 2); // attempt and flags,  (NOTE: legacy was: TXT_TYPE_PLAIN)
           }
           send_ack = false;
         } else {
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+          {
+            char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+            RoomLogPublisher::DirectMessage m = { client->id.pub_key, client->permissions, "cli_data", false, (const char*)&data[5], sender_timestamp };
+            _room_log.publishDirectMessage(m, ts);
+          }
+#endif
           temp[5] = 0;      // no reply
           send_ack = false; // and no ACK...  user shoudn't be sending these
         }
       } else { // TXT_TYPE_PLAIN
         if ((client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) {
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+          {
+            char ts[40]; roomLogTimestamp(ts, sizeof(ts));
+            RoomLogPublisher::DirectMessage m = { client->id.pub_key, client->permissions, "plain", false, (const char*)&data[5], sender_timestamp };
+            _room_log.publishDirectMessage(m, ts);
+          }
+#endif
           temp[5] = 0;      // no reply
           send_ack = false; // no ACK
         } else {
@@ -981,11 +1064,10 @@ void MyMesh::begin(FILESYSTEM *fs) {
     bridge = new MQTTBridge(&_prefs, _cli.getObserverPrefs(), _mgr, getRTCClock(), &self_id);
     if (bridge) {
       // Set device public key for MQTT topics
-      char device_id[65];
       mesh::LocalIdentity self_id = getSelfId();
-      mesh::Utils::toHex(device_id, self_id.pub_key, PUB_KEY_SIZE);
-      MESH_DEBUG_PRINTLN("Setting device ID: %s", device_id);
-      bridge->setDeviceID(device_id);
+      mesh::Utils::toHex(_device_id_hex, self_id.pub_key, PUB_KEY_SIZE);
+      MESH_DEBUG_PRINTLN("Setting device ID: %s", _device_id_hex);
+      bridge->setDeviceID(_device_id_hex);
 
       // Set firmware version
       bridge->setFirmwareVersion(getFirmwareVer());
@@ -1000,6 +1082,13 @@ void MyMesh::begin(FILESYSTEM *fs) {
       bridge->setStatsSources(this, _radio, _cli.getBoard(), _ms);
 
       bridge->begin();
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+      EthernetObserverPrefsStore::load(_fs, &ethernetObserverPrefs());
+      bridge->setEthernetPrefs(&ethernetObserverPrefs());
+      _room_log.setSink(roomLogSink, this);
+      _room_log.setOrigin(_prefs.node_name, _device_id_hex);
+      applyRoomLogFlags();
+#endif
     }
   }
 #endif
@@ -1431,6 +1520,9 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         if (acl.applyPermissions(self_id, pubkey, hex_len / 2, perms)) {
           dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);   // trigger acl.save()
           strcpy(reply, "OK");
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+          logRoomEvent("acl_change", pubkey, "ok", command);
+#endif
         } else {
           strcpy(reply, "Err - invalid params");
         }
@@ -1510,8 +1602,19 @@ void MyMesh::loop() {
   // Check radio FIRST to ensure we don't miss incoming packets
   // MQTT processing can take time, so we prioritize radio reception
   mesh::Mesh::loop();
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  if (bridge && _prefs.bridge_enabled) {
+    bridge->loop();
+    unsigned long now_ms = _ms->getMillis();
+    if ((long)(now_ms - _next_room_stats_at) >= 0) {
+      publishRoomStats();
+      _next_room_stats_at = now_ms + _cli.getObserverPrefs()->mqtt_status_interval;
+    }
+  }
+#else
 #ifdef WITH_MQTT_BRIDGE
-  // bridge.loop() is now handled by FreeRTOS task on Core 0 - no need to call it here
+  // bridge.loop() is handled by the FreeRTOS task on Core 0 for ESP32 builds
+#endif
 #endif
 
   if (millisHasNowPassed(next_push) && acl.getNumClients() > 0) {

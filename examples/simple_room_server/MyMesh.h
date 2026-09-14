@@ -32,6 +32,12 @@
 #include "helpers/esp32/WebConfigServer.h"   // defines WITH_WEBCONFIG on ESP32
 #endif
 
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+#include "helpers/RoomLogPublisher.h"
+#include "helpers/EthernetObserverPrefs.h"
+#include "helpers/MQTTMessageBuilder.h"
+#endif
+
 #ifdef WITH_SNMP
 #include "helpers/SNMPAgent.h"
 #endif
@@ -198,6 +204,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
 #endif
 #ifdef WITH_MQTT_BRIDGE
   MQTTBridge* bridge;
+  char _device_id_hex[65];
+#endif
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+  RoomLogPublisher _room_log;
+  unsigned long _next_room_stats_at = 0;
+  static bool roomLogSink(void* ctx, const char* suffix, const char* json, size_t len, bool retain);
+  void roomLogTimestamp(char* buf, size_t buf_size);
+  void logRoomEvent(const char* event, const uint8_t* actor, const char* result, const char* detail);
+  void publishRoomStats();
+  void applyRoomLogFlags();
 #endif
 #ifdef WITH_SNMP
   MeshSNMPAgent _snmp_agent;
@@ -288,6 +304,10 @@ public:
 
   void savePrefs() override {
     _cli.savePrefs(_fs);
+#ifdef WITH_MQTT_BRIDGE_ETHERNET
+    EthernetObserverPrefsStore::save(_fs, ethernetObserverPrefs());
+    applyRoomLogFlags();
+#endif
   }
 
   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
