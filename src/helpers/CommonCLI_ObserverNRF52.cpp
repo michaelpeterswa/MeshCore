@@ -27,17 +27,6 @@ static bool parseOnOff(const char* v, uint8_t* out) {
 }
 static void copyStr(char* dst, size_t dst_size, const char* src) { strncpy(dst, src, dst_size - 1); dst[dst_size - 1] = 0; }
 
-// The audience is placed directly into an MQTT topic segment (see
-// RoomLogPublisher/JWTHelper), so '+'/'#' (MQTT wildcard characters) or a
-// control byte would let a device-signed PUBLISH topic be mistaken for a
-// subscription filter, which makes conforming brokers drop the connection.
-static bool audienceValid(const char* s) {
-  for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
-    if (*p == '+' || *p == '#' || *p < 0x20 || *p == 0x7F) return false;
-  }
-  return true;
-}
-
 static bool isUnsupportedSetting(const char* config) {
   return startsWith(config, "wifi.") || startsWith(config, "snmp") || startsWith(config, "alert") ||
          startsWith(config, "mqtt.analyzer.") || startsWith(config, "mqtt2") || startsWith(config, "mqtt3") ||
@@ -114,7 +103,7 @@ bool CommonCLI::handleObserverSetCmd(uint32_t sender_timestamp, const char* conf
     // so reject wildcard/control bytes up front rather than let a bad value take
     // the bridge's connection down later.
     const char* v = afterPrefix(config, "mqtt.auth.aud");
-    if (!audienceValid(v)) { strcpy(reply, "ERR: audience must not contain + # or control characters"); return true; }
+    if (!MQTTEthernetPolicy::audienceValid(v)) { strcpy(reply, "ERR: audience must not contain + # or control characters"); return true; }
     copyStr(eth.auth_audiences, sizeof(eth.auth_audiences), v);
   } else if (startsWith(config, "mqtt.auth.life ")) {
     uint32_t v = (uint32_t)atoi(afterPrefix(config, "mqtt.auth.life"));

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cstring>
 #include "helpers/MQTTEthernetPolicy.h"
 
 namespace P = MQTTEthernetPolicy;
@@ -41,6 +42,67 @@ TEST(MQTTEthernetPolicy, RenewalAtTwoThirdsOfLife) {
   EXPECT_FALSE(P::tokenRenewalDue(1000 + 2199, 1000, 3300));
   EXPECT_TRUE(P::tokenRenewalDue(1000 + 2200, 1000, 3300));
   EXPECT_TRUE(P::tokenRenewalDue(5000, 0, 3300));   // never issued
+}
+
+TEST(MQTTEthernetPolicy, RedactsPasswordCommand) {
+  char out[168];
+  P::redactAdminCommand("password hunter2", out, sizeof(out));
+  EXPECT_STREQ("password <redacted>", out);
+}
+
+TEST(MQTTEthernetPolicy, RedactsSetGuestPassword) {
+  char out[168];
+  P::redactAdminCommand("set guest.password hello", out, sizeof(out));
+  EXPECT_STREQ("set guest.password <redacted>", out);
+}
+
+TEST(MQTTEthernetPolicy, RedactsSetPrvKeyCaseInsensitively) {
+  char out[168];
+  P::redactAdminCommand("set PRV.KEY abcd", out, sizeof(out));
+  EXPECT_STREQ("set PRV.KEY <redacted>", out);
+}
+
+TEST(MQTTEthernetPolicy, RedactsSetPsk) {
+  char out[168];
+  P::redactAdminCommand("set alert.psk ff", out, sizeof(out));
+  EXPECT_STREQ("set alert.psk <redacted>", out);
+}
+
+TEST(MQTTEthernetPolicy, LeavesUnrelatedCommandsUnchanged) {
+  char out[168];
+  P::redactAdminCommand("get stats", out, sizeof(out));
+  EXPECT_STREQ("get stats", out);
+  P::redactAdminCommand("setperm 12ab 3", out, sizeof(out));
+  EXPECT_STREQ("setperm 12ab 3", out);
+}
+
+TEST(MQTTEthernetPolicy, RedactHandlesEmptyString) {
+  char out[168];
+  P::redactAdminCommand("", out, sizeof(out));
+  EXPECT_STREQ("", out);
+}
+
+TEST(MQTTEthernetPolicy, RedactTruncatesAndNulTerminatesOversizedInput) {
+  char cmd[201];
+  memset(cmd, 'a', sizeof(cmd) - 1);
+  cmd[sizeof(cmd) - 1] = '\0';   // 200 'a' characters, no redaction keyword
+  char out[168];
+  P::redactAdminCommand(cmd, out, sizeof(out));
+  EXPECT_EQ(strlen(out), sizeof(out) - 1);   // truncated to cap, NUL-terminated
+  EXPECT_EQ(out[sizeof(out) - 1], '\0');
+  for (size_t i = 0; i < sizeof(out) - 1; i++) EXPECT_EQ(out[i], 'a');
+}
+
+TEST(MQTTEthernetPolicy, AudienceValidAcceptsPlainStrings) {
+  EXPECT_TRUE(P::audienceValid("a.b.c"));
+  EXPECT_TRUE(P::audienceValid("a/b"));
+}
+
+TEST(MQTTEthernetPolicy, AudienceValidRejectsWildcardsAndControlBytes) {
+  EXPECT_FALSE(P::audienceValid("a+b"));
+  EXPECT_FALSE(P::audienceValid("a#b"));
+  EXPECT_FALSE(P::audienceValid("a\x01" "b"));
+  EXPECT_FALSE(P::audienceValid("a\x7f" "b"));
 }
 
 int main(int argc, char** argv) {
