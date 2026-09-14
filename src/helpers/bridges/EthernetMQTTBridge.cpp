@@ -24,7 +24,8 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
     _publish_ok(0), _publish_err(0), _slot_state("inactive"), _time_synced(false),
     _next_status_at(0), _next_ntp_at(0), _next_neighbors_at(0), _next_link_at(0), _next_auth_at(0),
     _staged_raw_len(0), _staged_snr(0), _staged_rssi(0), _staged_valid(false),
-    _packet_retry_pending(false), _event_retry_pending(false) {
+    _packet_retry_pending(false), _event_retry_pending(false),
+    _front_packets_done(false), _front_raw_done(false) {
   _device_id[0] = _firmware_version[0] = _board_model[0] = _build_date[0] = 0;
   _origin[0] = _iata[0] = _client_id[0] = 0;
   s_instance = this;
@@ -52,7 +53,10 @@ void EthernetMQTTBridge::onPacketReceived(mesh::Packet* packet) {
   else { e.raw_len = 0; e.snr = 0; e.rssi = 0; }
   _staged_valid = false;
   e.rtc_secs = _rtc->getCurrentTime();
-  _packet_ring.push(e);
+  // If this push overwrites the current front (ring was full), any in-flight
+  // per-topic progress for that dropped entry is now stale: reset it so the
+  // next drainPacketRing() call starts the new front cleanly.
+  if (_packet_ring.push(e)) { _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false; }
 }
 
 void EthernetMQTTBridge::sendPacket(mesh::Packet* packet) {
@@ -64,7 +68,7 @@ void EthernetMQTTBridge::sendPacket(mesh::Packet* packet) {
   e.blob_len = packet->writeTo(e.blob);
   e.is_tx = true; e.raw_len = 0; e.snr = 0; e.rssi = 0;
   e.rtc_secs = _rtc->getCurrentTime();
-  _packet_ring.push(e);
+  if (_packet_ring.push(e)) { _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false; }
 }
 
 void EthernetMQTTBridge::setDeviceID(const char* v) { strncpy(_device_id, v, sizeof(_device_id) - 1); _device_id[sizeof(_device_id) - 1] = 0; }
@@ -102,31 +106,71 @@ bool EthernetMQTTBridge::drainPacketRing() {
   PacketEntry* e = _packet_ring.front();
   if (!e) return false;
   mesh::Packet pkt;
-  if (!pkt.readFrom(e->blob, e->blob_len)) { _packet_ring.pop(); return true; }
+  if (!pkt.readFrom(e->blob, e->blob_len)) {
+    _packet_ring.pop();
+    _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false;
+    return true;
+  }
   long usec = 0;
-  bool all_ok = true;
   char topic[128];
 
-  if (_obs->mqtt_packets_enabled && topicFor("packets", topic, sizeof(topic))) {
-    int len;
-    if (!e->is_tx && e->raw_len > 0) {
-      len = MQTTMessageBuilder::buildPacketJSONFromRawAt(_doc, e->raw, e->raw_len, &pkt, false, _origin, _device_id,
-                                                          e->snr, e->rssi, NAN, nullptr, (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+  // Each topic is tracked independently so a partial success (one topic
+  // publishes, the other fails) never republishes the already-succeeded
+  // topic on the retry pass, and never double-counts _publish_ok for it.
+  if (_obs->mqtt_packets_enabled && !_front_packets_done) {
+    if (topicFor("packets", topic, sizeof(topic))) {
+      int len;
+      if (!e->is_tx && e->raw_len > 0) {
+        len = MQTTMessageBuilder::buildPacketJSONFromRawAt(_doc, e->raw, e->raw_len, &pkt, false, _origin, _device_id,
+                                                            e->snr, e->rssi, NAN, nullptr, (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+      } else {
+        len = MQTTMessageBuilder::buildPacketJSONAt(_doc, &pkt, e->is_tx, _origin, _device_id, nullptr,
+                                                     (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+      }
+      if (len > 0) {
+        bool ok = _client.publish(topic, (const uint8_t*)_json, len, false);
+        if (ok) { _publish_ok++; _front_packets_done = true; }
+        else { _publish_err++; }   // transient: retried on the next pass
+      } else {
+        // Deterministic builder failure (e.g. JSON too large for _json):
+        // retrying will not help, so count it and mark this topic done.
+        _publish_err++; _front_packets_done = true;
+      }
     } else {
-      len = MQTTMessageBuilder::buildPacketJSONAt(_doc, &pkt, e->is_tx, _origin, _device_id, nullptr,
-                                                   (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+      // Deterministic topicFor failure (e.g. unset IATA): retrying will not
+      // help either, so count it the same way drainEventRing does.
+      _publish_err++; _front_packets_done = true;
     }
-    if (len > 0) { bool ok = _client.publish(topic, (const uint8_t*)_json, len, false); ok ? _publish_ok++ : _publish_err++; all_ok = all_ok && ok; }
   }
-  if (_obs->mqtt_raw_enabled && topicFor("raw", topic, sizeof(topic))) {
-    int len = MQTTMessageBuilder::buildRawJSONAt(_doc, &pkt, _origin, _device_id, nullptr,
-                                                  (time_t)e->rtc_secs, usec, _json, sizeof(_json));
-    if (len > 0) { bool ok = _client.publish(topic, (const uint8_t*)_json, len, false); ok ? _publish_ok++ : _publish_err++; all_ok = all_ok && ok; }
+  if (_obs->mqtt_raw_enabled && !_front_raw_done) {
+    if (topicFor("raw", topic, sizeof(topic))) {
+      int len = MQTTMessageBuilder::buildRawJSONAt(_doc, &pkt, _origin, _device_id, nullptr,
+                                                    (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+      if (len > 0) {
+        bool ok = _client.publish(topic, (const uint8_t*)_json, len, false);
+        if (ok) { _publish_ok++; _front_raw_done = true; }
+        else { _publish_err++; }
+      } else {
+        _publish_err++; _front_raw_done = true;
+      }
+    } else {
+      _publish_err++; _front_raw_done = true;
+    }
   }
 
-  if (all_ok) { _packet_retry_pending = false; _packet_ring.pop(); return true; }
-  if (_packet_retry_pending) { _packet_ring.pop(); _packet_retry_pending = false; }
-  else _packet_retry_pending = true;
+  bool packets_ok = !_obs->mqtt_packets_enabled || _front_packets_done;
+  bool raw_ok = !_obs->mqtt_raw_enabled || _front_raw_done;
+  if (packets_ok && raw_ok) {
+    _packet_ring.pop();
+    _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false;
+    return true;
+  }
+  if (_packet_retry_pending) {
+    _packet_ring.pop();
+    _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false;
+  } else {
+    _packet_retry_pending = true;
+  }
   return true;
 }
 

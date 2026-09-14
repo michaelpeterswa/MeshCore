@@ -180,6 +180,13 @@ private:
   MQTTEventRing<EventEntry, MQTT_ETH_EVENT_RING> _event_ring;
   bool _packet_retry_pending;
   bool _event_retry_pending;
+  // Per-topic progress for the current _packet_ring front entry. Reset to
+  // false whenever the front entry changes (pop(), or push() dropping the
+  // front while a retry was pending) so state never leaks onto the next
+  // entry. A topic disabled by prefs is treated as done without ever being
+  // set here.
+  bool _front_packets_done;
+  bool _front_raw_done;
 
   JsonDocument _doc;
   char _json[1024];
