@@ -39,8 +39,8 @@ bool EthernetObserverPrefsStore::save(FILESYSTEM* fs, const EthernetObserverPref
   size_t n = EthernetObserverPrefsCodec::encode(in, buf, sizeof(buf));
   if (n == 0) return false;
 #if defined(NRF52_PLATFORM)
+  fs->remove(kPath);
   File f = fs->open(kPath, FILE_O_WRITE);
-  if (f) f.seek(0);
 #else
   File f = fs->open(kPath, "w");
 #endif

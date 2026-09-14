@@ -7,7 +7,9 @@
 /**
  * Formats the room server's MQTT log topics and hands each JSON document to
  * a sink. Platform-neutral: no Arduino, no bridge dependency. The sink is
- * expected to queue, not block.
+ * expected to queue, not block. The origin strings passed to setOrigin() are
+ * retained by pointer, not copied — see setOrigin() for the lifetime
+ * requirement.
  */
 class RoomLogPublisher {
 public:
@@ -26,6 +28,9 @@ public:
 
   RoomLogPublisher();
   void setSink(Sink fn, void* ctx) { _sink = fn; _ctx = ctx; }
+  // Stores the pointers as given, not copies of the strings — origin and
+  // origin_id must outlive this RoomLogPublisher (or be updated again before
+  // they are freed/reused).
   void setOrigin(const char* origin, const char* origin_id) { _origin = origin; _origin_id = origin_id; }
   void setEnabled(bool posts, bool events, bool dm, bool stats) { _posts = posts; _events = events; _dm = dm; _stats = stats; }
 
