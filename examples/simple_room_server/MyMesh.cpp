@@ -393,6 +393,65 @@ void MyMesh::publishRoomStats() {
   char ts[40]; roomLogTimestamp(ts, sizeof(ts));
   _room_log.publishStats(s, ts);
 }
+
+// Copies cmd into out, replacing the argument of secret-bearing commands with "<redacted>".
+// Redacts: `password <arg>`, and `set <key> <arg>` where <key> contains (case-insensitively)
+// "password", "prv.key", or "psk". Everything up to and including the key token is kept;
+// the rest of the command is replaced with " <redacted>". Anything else is copied unchanged.
+void MyMesh::redactAdminCommand(const char* cmd, char* out, size_t out_size) {
+  if (!out || out_size == 0) return;
+  if (!cmd) { out[0] = 0; return; }
+
+  const char* p = cmd;
+  while (*p == ' ') p++;
+  const char* tok1_start = p;
+  while (*p && *p != ' ') p++;
+  size_t tok1_len = (size_t)(p - tok1_start);
+
+  bool redact = false;
+  size_t keep_len = 0; // bytes of cmd (from the start) to keep before appending " <redacted>"
+
+  if (tok1_len == 8 && strncmp(tok1_start, "password", 8) == 0) {
+    redact = true;
+    keep_len = (size_t)(p - cmd);
+  } else if (tok1_len == 3 && strncmp(tok1_start, "set", 3) == 0) {
+    const char* q = p;
+    while (*q == ' ') q++;
+    const char* tok2_start = q;
+    while (*q && *q != ' ') q++;
+    size_t tok2_len = (size_t)(q - tok2_start);
+    if (tok2_len > 0) {
+      char key[64];
+      size_t klen = tok2_len < sizeof(key) - 1 ? tok2_len : sizeof(key) - 1;
+      for (size_t i = 0; i < klen; i++) {
+        char c = tok2_start[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        key[i] = c;
+      }
+      key[klen] = 0;
+      if (strstr(key, "password") || strstr(key, "prv.key") || strstr(key, "psk")) {
+        redact = true;
+        keep_len = (size_t)(q - cmd);
+      }
+    }
+  }
+
+  size_t cap = out_size - 1;
+  if (redact) {
+    size_t n = keep_len < cap ? keep_len : cap;
+    memcpy(out, cmd, n);
+    static const char kSuffix[] = " <redacted>";
+    size_t rem = cap - n;
+    size_t sn = sizeof(kSuffix) - 1 < rem ? sizeof(kSuffix) - 1 : rem;
+    memcpy(out + n, kSuffix, sn);
+    out[n + sn] = 0;
+  } else {
+    size_t n = strlen(cmd);
+    if (n > cap) n = cap;
+    memcpy(out, cmd, n);
+    out[n] = 0;
+  }
+}
 #endif
 
 uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
@@ -632,10 +691,12 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
           } else {
 #ifdef WITH_MQTT_BRIDGE_ETHERNET
             {
+              char redacted[168];
+              redactAdminCommand((const char*)&data[5], redacted, sizeof(redacted));
               char ts[40]; roomLogTimestamp(ts, sizeof(ts));
-              RoomLogPublisher::DirectMessage m = { client->id.pub_key, client->permissions, "cli_data", true, (const char*)&data[5], sender_timestamp };
+              RoomLogPublisher::DirectMessage m = { client->id.pub_key, client->permissions, "cli_data", true, redacted, sender_timestamp };
               _room_log.publishDirectMessage(m, ts);
-              logRoomEvent("admin_cmd", client->id.pub_key, "ok", (const char*)&data[5]);
+              logRoomEvent("admin_cmd", client->id.pub_key, "ok", redacted);
             }
 #endif
             handleCommand(sender_timestamp, (char *)&data[5], (char *)&temp[5]);

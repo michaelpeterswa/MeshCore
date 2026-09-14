@@ -214,6 +214,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
   void logRoomEvent(const char* event, const uint8_t* actor, const char* result, const char* detail);
   void publishRoomStats();
   void applyRoomLogFlags();
+  // Copies cmd into out, replacing the argument of secret-bearing commands with "<redacted>".
+  static void redactAdminCommand(const char* cmd, char* out, size_t out_size);
 #endif
 #ifdef WITH_SNMP
   MeshSNMPAgent _snmp_agent;
