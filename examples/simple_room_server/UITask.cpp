@@ -6,7 +6,7 @@
 #define USER_BTN_PRESSED LOW
 #endif
 
-#ifdef WITH_MQTT_BRIDGE
+#if defined(WITH_MQTT_BRIDGE) && !defined(WITH_MQTT_BRIDGE_ETHERNET)
 #include <WiFi.h>
 #include <helpers/esp32/WebConfigServer.h>   // defines WITH_WEBCONFIG on ESP32
 #endif
@@ -131,7 +131,7 @@ void UITask::renderCurrScreen() {
     sprintf(tmp, "BW: %03.2f CR: %d", _node_prefs->bw, _node_prefs->cr);
     _display->print(tmp);
 
-#ifdef WITH_MQTT_BRIDGE
+#if defined(WITH_MQTT_BRIDGE) && !defined(WITH_MQTT_BRIDGE_ETHERNET)
     // Display IP address for MQTT bridge devices
     if (WiFi.status() == WL_CONNECTED) {
       IPAddress ip = WiFi.localIP();

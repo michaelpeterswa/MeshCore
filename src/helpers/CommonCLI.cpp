@@ -469,7 +469,13 @@ static bool recoverMqttPrefsFiles(FILESYSTEM* fs) {
 // cleanup. A power loss at every boundary leaves at least one recoverable file.
 class MQTTPrefsFileStore {
 public:
-  explicit MQTTPrefsFileStore(FILESYSTEM* fs) : _fs(fs) {}
+  explicit MQTTPrefsFileStore(FILESYSTEM* fs) : _fs(fs)
+#if defined(NRF52_PLATFORM)
+    // Adafruit_LittleFS_Namespace::File has no default constructor (unlike
+    // ESP32/RP2040's File types), so _file must be constructed here.
+    , _file(*fs)
+#endif
+  {}
 
   bool begin() {
     _finished = false;

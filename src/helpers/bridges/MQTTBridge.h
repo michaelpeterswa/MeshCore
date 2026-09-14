@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(WITH_MQTT_BRIDGE_ETHERNET)
+// nRF52 + RAK13800 build: the Ethernet bridge stands in for MQTTBridge so the
+// room server, AlertReporter, and CommonCLI compile against one name.
+#include "helpers/bridges/EthernetMQTTBridge.h"
+using MQTTBridge = EthernetMQTTBridge;
+#else
 #include "MeshCore.h"
 #include "helpers/bridges/BridgeBase.h"
 #include <PsychicMqttClient.h>
@@ -696,3 +702,4 @@ public:
 };
 
 #endif
+#endif  // WITH_MQTT_BRIDGE_ETHERNET
