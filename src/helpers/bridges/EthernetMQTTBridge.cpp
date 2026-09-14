@@ -10,6 +10,7 @@
 #include <NTPClient.h>
 #include <Dns.h>
 #include <string.h>
+#include <math.h>
 
 EthernetMQTTBridge* EthernetMQTTBridge::s_instance = nullptr;
 
@@ -29,9 +30,42 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
   s_instance = this;
 }
 
-void EthernetMQTTBridge::onPacketReceived(mesh::Packet*) {}
-void EthernetMQTTBridge::sendPacket(mesh::Packet*) {}
-void EthernetMQTTBridge::storeRawRadioData(const uint8_t*, int, float, float) {}
+void EthernetMQTTBridge::storeRawRadioData(const uint8_t* raw_data, int len, float snr, float rssi) {
+  if (len <= 0 || len > (int)sizeof(_staged_raw)) { _staged_valid = false; return; }
+  memcpy(_staged_raw, raw_data, len);
+  _staged_raw_len = (uint8_t)len;
+  _staged_snr = snr; _staged_rssi = rssi;
+  _staged_valid = true;
+}
+
+static bool typeAllowed(uint16_t mask, uint8_t type) { return (mask & (1u << (type & 0x0F))) != 0; }
+
+void EthernetMQTTBridge::onPacketReceived(mesh::Packet* packet) {
+  if (!_initialized || !packet) return;
+  if (!_obs->mqtt_rx_enabled) return;
+  if (!_obs->mqtt_packets_enabled && !_obs->mqtt_raw_enabled) return;
+  if (!typeAllowed(_obs->mqtt_slot_packet_filter[0], packet->getPayloadType())) return;
+  PacketEntry e;
+  e.blob_len = packet->writeTo(e.blob);
+  e.is_tx = false;
+  if (_staged_valid) { memcpy(e.raw, _staged_raw, _staged_raw_len); e.raw_len = _staged_raw_len; e.snr = _staged_snr; e.rssi = _staged_rssi; }
+  else { e.raw_len = 0; e.snr = 0; e.rssi = 0; }
+  _staged_valid = false;
+  e.rtc_secs = _rtc->getCurrentTime();
+  _packet_ring.push(e);
+}
+
+void EthernetMQTTBridge::sendPacket(mesh::Packet* packet) {
+  if (!_initialized || !packet) return;
+  if (!_obs->mqtt_tx_enabled) return;
+  if (!_obs->mqtt_packets_enabled && !_obs->mqtt_raw_enabled) return;
+  if (!typeAllowed(_obs->mqtt_slot_packet_filter[0], packet->getPayloadType())) return;
+  PacketEntry e;
+  e.blob_len = packet->writeTo(e.blob);
+  e.is_tx = true; e.raw_len = 0; e.snr = 0; e.rssi = 0;
+  e.rtc_secs = _rtc->getCurrentTime();
+  _packet_ring.push(e);
+}
 
 void EthernetMQTTBridge::setDeviceID(const char* v) { strncpy(_device_id, v, sizeof(_device_id) - 1); _device_id[sizeof(_device_id) - 1] = 0; }
 void EthernetMQTTBridge::setFirmwareVersion(const char* v) { strncpy(_firmware_version, v, sizeof(_firmware_version) - 1); _firmware_version[sizeof(_firmware_version) - 1] = 0; }
@@ -51,12 +85,65 @@ unsigned long EthernetMQTTBridge::getSlotCurrentOutageStartMs(int) const { retur
 bool EthernetMQTTBridge::isSlotEnabledAndAttempted(int slot_index) const { return slot_index == 0 && _initialized; }
 const char* EthernetMQTTBridge::getSlotPresetName(int) const { return _obs ? _obs->mqtt_slot_preset[0] : ""; }
 
-bool EthernetMQTTBridge::publishRoomTopic(const char*, const char*, size_t, bool) { return false; }
+bool EthernetMQTTBridge::publishRoomTopic(const char* suffix, const char* json, size_t len, bool retain) {
+  if (!_initialized || !suffix || !json) return false;
+  if (len >= sizeof(EventEntry::json)) return false;
+  EventEntry e;
+  strncpy(e.suffix, suffix, sizeof(e.suffix) - 1); e.suffix[sizeof(e.suffix) - 1] = 0;
+  e.retain = retain; e.len = (uint16_t)len;
+  memcpy(e.json, json, len); e.json[len] = 0;
+  _event_ring.push(e);
+  return true;
+}
 
 bool EthernetMQTTBridge::publishNeighbors() { return false; }
 bool EthernetMQTTBridge::publishAuthTokens() { return false; }
-bool EthernetMQTTBridge::drainPacketRing() { return false; }
-bool EthernetMQTTBridge::drainEventRing() { return false; }
+bool EthernetMQTTBridge::drainPacketRing() {
+  PacketEntry* e = _packet_ring.front();
+  if (!e) return false;
+  mesh::Packet pkt;
+  if (!pkt.readFrom(e->blob, e->blob_len)) { _packet_ring.pop(); return true; }
+  long usec = 0;
+  bool all_ok = true;
+  char topic[128];
+
+  if (_obs->mqtt_packets_enabled && topicFor("packets", topic, sizeof(topic))) {
+    int len;
+    if (!e->is_tx && e->raw_len > 0) {
+      len = MQTTMessageBuilder::buildPacketJSONFromRawAt(_doc, e->raw, e->raw_len, &pkt, false, _origin, _device_id,
+                                                          e->snr, e->rssi, NAN, nullptr, (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+    } else {
+      len = MQTTMessageBuilder::buildPacketJSONAt(_doc, &pkt, e->is_tx, _origin, _device_id, nullptr,
+                                                   (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+    }
+    if (len > 0) { bool ok = _client.publish(topic, (const uint8_t*)_json, len, false); ok ? _publish_ok++ : _publish_err++; all_ok = all_ok && ok; }
+  }
+  if (_obs->mqtt_raw_enabled && topicFor("raw", topic, sizeof(topic))) {
+    int len = MQTTMessageBuilder::buildRawJSONAt(_doc, &pkt, _origin, _device_id, nullptr,
+                                                  (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+    if (len > 0) { bool ok = _client.publish(topic, (const uint8_t*)_json, len, false); ok ? _publish_ok++ : _publish_err++; all_ok = all_ok && ok; }
+  }
+
+  if (all_ok) { _packet_retry_pending = false; _packet_ring.pop(); return true; }
+  if (_packet_retry_pending) { _packet_ring.pop(); _packet_retry_pending = false; }
+  else _packet_retry_pending = true;
+  return true;
+}
+
+bool EthernetMQTTBridge::drainEventRing() {
+  EventEntry* e = _event_ring.front();
+  if (!e) return false;
+  char topic[128];
+  bool ok = false;
+  if (topicFor(e->suffix, topic, sizeof(topic))) {
+    ok = _client.publish(topic, (const uint8_t*)e->json, e->len, e->retain);
+  }
+  if (ok) { _publish_ok++; _event_retry_pending = false; _event_ring.pop(); return true; }
+  _publish_err++;
+  if (_event_retry_pending) { _event_ring.pop(); _event_retry_pending = false; }   // second failure: drop
+  else _event_retry_pending = true;
+  return true;
+}
 
 // ---- Step 1: link and topic helpers ----
 
