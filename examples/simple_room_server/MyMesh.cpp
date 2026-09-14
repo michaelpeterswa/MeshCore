@@ -497,10 +497,33 @@ void MyMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32
 int MyMesh::collectNeighbors(MQTTPayloadBuilder::NeighborsMessageEntry* out, int max_entries,
                              char* hex_pool, size_t hex_pool_size, uint32_t now_secs) {
   const size_t hex_size = PUB_KEY_SIZE * 2 + 1;
+
+  // Gather candidate slot indices first, then insertion-sort them by
+  // heard_timestamp descending (most recently heard first), before filling
+  // out/hex_pool: MQTTPayloadBuilder::buildNeighborsMessage drops the tail
+  // once the fixed publish buffer fills, and its comment documents that
+  // entries must arrive most- to least-useful -- slot order is arbitrary
+  // and would let overflow drop entries essentially at random. This
+  // mirrors the insertion sort the ESP32 path runs before publishing.
+  int candidates[MAX_NEIGHBOURS];
+  int candidate_count = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp != 0) candidates[candidate_count++] = i;
+  }
+  for (int i = 1; i < candidate_count; i++) {
+    int idx = candidates[i];
+    uint32_t key = neighbours[idx].heard_timestamp;
+    int j = i - 1;
+    while (j >= 0 && neighbours[candidates[j]].heard_timestamp < key) {
+      candidates[j + 1] = candidates[j];
+      j--;
+    }
+    candidates[j + 1] = idx;
+  }
+
   int n = 0;
-  for (int i = 0; i < MAX_NEIGHBOURS && n < max_entries; i++) {
-    NeighbourInfo& nb = neighbours[i];
-    if (nb.heard_timestamp == 0) continue;
+  for (int c = 0; c < candidate_count && n < max_entries; c++) {
+    NeighbourInfo& nb = neighbours[candidates[c]];
     if ((size_t)(n + 1) * hex_size > hex_pool_size) break;
     char* hex = hex_pool + n * hex_size;
     mesh::Utils::toHex(hex, nb.id.pub_key, PUB_KEY_SIZE);

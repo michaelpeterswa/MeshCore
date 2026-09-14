@@ -128,7 +128,37 @@ bool EthernetMQTTBridge::publishNeighbors() {
 
 bool EthernetMQTTBridge::publishAuthTokens() {
   if (!_eth || !_identity) return false;
-  _auth_count = MQTTEthernetPolicy::parseAudiences(_eth->auth_audiences, _auth_audiences, 4);
+
+  // _auth_audiences/_auth_issued_at persist across calls and must stay keyed
+  // by audience STRING, never by array position: the configured audience
+  // list can change between calls (an entry removed from the front, or a
+  // new one appended), and a positional match would silently hand a
+  // renewal timer to a different audience -- suppressing a newly added one
+  // for up to two thirds of the token lifetime, or renewing a stale one.
+  // Parse into a local buffer, match each parsed audience against the
+  // previous _auth_audiences by string equality to inherit its issued_at,
+  // then replace _auth_audiences/_auth_issued_at with the parsed list (in
+  // parsed order) so a removed or renamed audience loses its timer and a
+  // genuinely new one starts at issued_at == 0.
+  char parsed[4][64];
+  int parsed_count = MQTTEthernetPolicy::parseAudiences(_eth->auth_audiences, parsed, 4);
+  uint32_t matched_issued_at[4];
+  for (int i = 0; i < parsed_count; i++) {
+    matched_issued_at[i] = 0;
+    for (int j = 0; j < _auth_count; j++) {
+      if (strcmp(parsed[i], _auth_audiences[j]) == 0) {
+        matched_issued_at[i] = _auth_issued_at[j];
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < parsed_count; i++) {
+    strncpy(_auth_audiences[i], parsed[i], sizeof(_auth_audiences[i]) - 1);
+    _auth_audiences[i][sizeof(_auth_audiences[i]) - 1] = '\0';
+    _auth_issued_at[i] = matched_issued_at[i];
+  }
+  _auth_count = parsed_count;
+
   if (_auth_count == 0 || !_time_synced) return false;
   uint32_t now = _rtc->getCurrentTime();
   uint32_t life = _eth->auth_life_secs ? _eth->auth_life_secs : 3300;
