@@ -20,6 +20,7 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
     _dispatcher(nullptr), _radio(nullptr), _board(nullptr), _ms(nullptr), _neighbor_source(nullptr),
     _client(_net), _link_up(false), _link_changed_at(0), _link_changes(0),
     _last_connect_attempt(0), _backoff(0), _broker_reconnects(0),
+    _link_gate(nullptr), _ntp_consec_failures(0),
     _broker_ip((uint32_t)0), _ntp_ip((uint32_t)0), _outage_started_at(0),
     _publish_ok(0), _publish_err(0), _slot_state("inactive"), _time_synced(false),
     _next_status_at(0), _next_ntp_at(0), _next_neighbors_at(0), _next_link_at(0), _next_auth_at(0),
@@ -164,7 +165,10 @@ bool EthernetMQTTBridge::publishAuthTokens() {
   uint32_t life = _eth->auth_life_secs ? _eth->auth_life_secs : 3300;
   for (int i = 0; i < _auth_count; i++) {
     if (!MQTTEthernetPolicy::tokenRenewalDue(now, _auth_issued_at[i], life)) continue;
-    static char token[600];
+    // Sized for a long audience plus owner (65) and email (64): the header
+    // and signature alone are ~250 bytes, and JWTHelper itself caps the
+    // signing input at under 897 bytes total.
+    static char token[1024];
     if (!JWTHelper::createAuthToken(*_identity, _auth_audiences[i], now, life, token, sizeof(token),
                                     _obs->mqtt_owner_public_key[0] ? _obs->mqtt_owner_public_key : nullptr,
                                     "meshcore-nrf52-eth",
@@ -274,7 +278,15 @@ bool EthernetMQTTBridge::drainEventRing() {
 
 // ---- Step 1: link and topic helpers ----
 
+// C1: ethernet_task (DHCP) and this bridge's loop() both run at FreeRTOS
+// priority 1 and both talk to the RAK13800 over the same SPI bus, which the
+// vendor library never locks. Calling Ethernet.linkStatus()/localIP() here
+// while ethernet_task is mid-DHCP races that SPI transaction. setLinkGate()
+// gives us a pointer to ethernet_task's "have a lease" flag; refuse to touch
+// Ethernet at all until it says so. A null gate (nobody called setLinkGate())
+// preserves the old behavior for anything that never wires one up.
 bool EthernetMQTTBridge::linkReady() const {
+  if (_link_gate && !*_link_gate) return false;
   if (Ethernet.hardwareStatus() == EthernetNoHardware) return false;
   if (Ethernet.linkStatus() != LinkON) return false;
   IPAddress ip = Ethernet.localIP();
@@ -291,6 +303,11 @@ void EthernetMQTTBridge::refreshLink(unsigned long now) {
     if (!up) {
       if (_client.connected()) _client.disconnect();
       onDisconnected(now);
+    } else {
+      // Cable/DHCP just came back: reconnect immediately instead of waiting
+      // out whatever backoff accumulated during the outage.
+      _backoff = 0;
+      _last_connect_attempt = 0;
     }
     // "fire immediately": = now, not 0. now - 0 only stays non-negative under
     // (long) for the first ~24.8 days of uptime; now - now is always exactly
@@ -340,12 +357,15 @@ void EthernetMQTTBridge::begin() {
   strncpy(_iata, _obs->mqtt_iata, sizeof(_iata) - 1); _iata[sizeof(_iata) - 1] = 0;
   getEffectiveMqttOrigin(_prefs, _obs, _origin, sizeof(_origin));
   snprintf(_client_id, sizeof(_client_id), "mc-%.16s", _device_id);
-  _client.setBufferSize(MQTT_MAX_PACKET_SIZE);
+  // Sized for _json (1536), independent of the MQTT_MAX_PACKET_SIZE build
+  // flag (which can stay set for other consumers).
+  _client.setBufferSize(1536);
   _client.setKeepAlive(55);
   _client.setSocketTimeout(MQTT_SOCKET_TIMEOUT);
   _net.setConnectionTimeout(1500);
   _backoff = 0;
   _last_connect_attempt = 0;
+  _ntp_consec_failures = 0;
   // Explicit "= millis()" rather than relying on the constructor's 0: the
   // constructor's 0 only reads as "due now" because millis() is still small
   // at boot; begin() can run later (e.g. after end()/begin() cycling), so set
@@ -576,6 +596,7 @@ bool EthernetMQTTBridge::publishStatus() {
   // on _doc directly into _json and does not clear _doc afterward, so _doc
   // still holds the same tree here; adding a field and re-serializing works.
   _doc["time_synced"] = _time_synced;   // extra field, harmless to analyzers
+  if (measureJson(_doc) + 1 > sizeof(_json)) { _publish_err++; return false; }
   len = (int)serializeJson(_doc, _json, sizeof(_json));
   bool ok = _client.publish(topic, (const uint8_t*)_json, len, true);
   ok ? _publish_ok++ : _publish_err++;
@@ -624,8 +645,20 @@ void EthernetMQTTBridge::loop() {
   _client.loop();
 
   if ((long)(now - _next_ntp_at) >= 0) {
-    syncNtp(2000);
-    _next_ntp_at = now + (_time_synced ? 3600000UL : 60000UL);
+    bool synced_now = syncNtp(2000);
+    if (synced_now) {
+      _ntp_consec_failures = 0;
+      _next_ntp_at = now + 3600000UL;
+    } else {
+      // I4: exponential backoff (60s, 120s, 240s, ... capped at 900s) instead
+      // of retrying every 60s forever when NTP is unreachable (e.g. an
+      // isolated LAN with no route to the internet default).
+      uint8_t shift = _ntp_consec_failures < 4 ? _ntp_consec_failures : 4;
+      uint32_t delay_ms = 60000UL << shift;
+      if (delay_ms > 900000UL) delay_ms = 900000UL;
+      _next_ntp_at = now + delay_ms;
+      if (_ntp_consec_failures < 0xFF) _ntp_consec_failures++;
+    }
     return;   // one unit of work per pass
   }
   if ((long)(now - _next_link_at) >= 0) {

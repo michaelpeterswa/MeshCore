@@ -24,7 +24,7 @@ public:
     uint32_t acl_bytes, packet_drops, event_drops;
   };
 
-  static const size_t JSON_BUFFER_SIZE = 512;
+  static const size_t JSON_BUFFER_SIZE = 768;
 
   RoomLogPublisher();
   void setSink(Sink fn, void* ctx) { _sink = fn; _ctx = ctx; }

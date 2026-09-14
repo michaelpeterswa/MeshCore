@@ -98,6 +98,10 @@ public:
   // ---- Ethernet-build additions ----
   void setNeighborSource(NeighborSource* src) { _neighbor_source = src; }
   void setEthernetPrefs(EthernetObserverPrefs* eth) { _eth = eth; }
+  // See linkReady()'s definition for why this exists: until `ready` is
+  // non-null and true, linkReady() returns false without touching Ethernet
+  // at all, to avoid racing ethernet_task's DHCP on the shared SPI bus.
+  void setLinkGate(const volatile bool* ready) { _link_gate = ready; }
   /** Sink for RoomLogPublisher: queues JSON on the event ring. */
   bool publishRoomTopic(const char* suffix, const char* json, size_t len, bool retain);
   uint32_t packetDrops() const { return _packet_ring.drops(); }
@@ -120,7 +124,7 @@ public:
     char suffix[16];
     bool retain;
     uint16_t len;
-    char json[512];
+    char json[768];
   };
 
 private:
@@ -152,6 +156,14 @@ private:
   unsigned long _last_connect_attempt;
   uint8_t _backoff;
   uint32_t _broker_reconnects;
+  // Set by setLinkGate(); linkReady() refuses to touch Ethernet at all until
+  // this is null or *_link_gate is true (C1: avoids racing ethernet_task's
+  // DHCP for the SPI bus).
+  const volatile bool* _link_gate;
+  // Consecutive syncNtp() failures (I4): backs off the retry interval
+  // exponentially from 60s up to a 900s ceiling instead of retrying blindly
+  // every 60s forever when NTP is unreachable.
+  uint8_t _ntp_consec_failures;
   // Cached DNS results: resolveHost() must run before any socket-holding
   // connect()/beginPacket() call, never a hostname string, or the RAK13800
   // library resolves it internally (blocking loop() ~15s and briefly opening
@@ -189,7 +201,7 @@ private:
   bool _front_raw_done;
 
   JsonDocument _doc;
-  char _json[1024];
+  char _json[1536];
 
   // Auth token state: up to 4 audiences parsed from _eth->auth_audiences.
   uint32_t _auth_issued_at[4];

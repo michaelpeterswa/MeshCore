@@ -1323,6 +1323,8 @@ Not available on this build: `wifi.*`, `snmp.*`, `alert.*`, `mqtt.analyzer.*`, `
 
 **DNS and broker choice:** the broker and NTP server hostnames are resolved with a DNS lookup bounded to about 1 second (three 334 ms attempts); a dotted-quad address skips DNS entirely. A hostname broker therefore stalls the main loop for up to a second on every connect attempt while DNS is unreachable — prefer an IP address for the local broker.
 
+**NTP backoff:** a failed NTP sync backs off exponentially (60 s, 120 s, 240 s, ...) up to a 15-minute ceiling between retries rather than retrying every 60 s forever; on an isolated network with no route to the internet default, `set mqtt.ntp <LAN time server>` to a reachable LAN time server instead.
+
 **Settings storage:** the nRF52-only settings (`mqtt.room.*`, `mqtt.auth.*`) persist in their own `/mqtt_eth_prefs` file, separate from the shared `/mqtt_prefs` file used by `mqtt.iata`, `mqtt1.*`, and the other settings above.
 
 Notes: PubSubClient publishes at QoS 0 everywhere; retained topics are `status`, `room/stats`, `link`, and `auth/*`. Room posts report the room's own timestamp as `client_timestamp`. Reconnect backoff steps through 10 s, 30 s, 60 s, 120 s, then caps at 300 s. While the broker is unreachable, packets are held in a 16-entry ring and room events in an 8-entry ring; when a ring is full the oldest entry is evicted and counted in the drop counters (`drops=` in `get mqtt.status`, `packet_drops` and `event_drops` in `room/stats`). A publish that fails twice in a row is discarded and counted as a publish error (`err=` in `get mqtt.status`, `pub_err` in `get mqtt.stats`), not as a drop.
