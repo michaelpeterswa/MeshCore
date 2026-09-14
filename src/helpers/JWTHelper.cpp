@@ -8,7 +8,9 @@
 #include <SHA256.h>
 #include <string.h>
 #include "ed_25519.h"
+#if defined(ESP_PLATFORM)
 #include "mbedtls/base64.h"
+#endif
 
 // Base64 URL encoding table (without padding)
 static const char base64url_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -118,12 +120,53 @@ size_t JWTHelper::base64UrlEncode(const uint8_t* input, size_t inputLen, char* o
   }
   
   size_t outlen = 0;
+#if defined(ESP_PLATFORM)
   int ret = mbedtls_base64_encode((unsigned char*)output, outputSize - 1, &outlen, input, inputLen);
-  
+
   if (ret != 0) {
     return 0;
   }
-  
+#else
+  // Portable RFC 4648 base64 encoder (standard alphabet, '=' padding) for
+  // platforms without mbedtls (e.g. nRF52). The base64url post-processing
+  // below converts this to the same result mbedtls_base64_encode produces.
+  static const char standard_base64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  size_t needed = ((inputLen + 2) / 3) * 4;
+  if (needed > outputSize - 1) {
+    return 0;
+  }
+
+  size_t i = 0;
+  size_t o = 0;
+  while (i + 3 <= inputLen) {
+    uint32_t chunk = ((uint32_t)input[i] << 16) | ((uint32_t)input[i + 1] << 8) | (uint32_t)input[i + 2];
+    output[o++] = standard_base64_chars[(chunk >> 18) & 0x3F];
+    output[o++] = standard_base64_chars[(chunk >> 12) & 0x3F];
+    output[o++] = standard_base64_chars[(chunk >> 6) & 0x3F];
+    output[o++] = standard_base64_chars[chunk & 0x3F];
+    i += 3;
+  }
+
+  size_t remaining = inputLen - i;
+  if (remaining == 1) {
+    uint32_t chunk = (uint32_t)input[i] << 16;
+    output[o++] = standard_base64_chars[(chunk >> 18) & 0x3F];
+    output[o++] = standard_base64_chars[(chunk >> 12) & 0x3F];
+    output[o++] = '=';
+    output[o++] = '=';
+  } else if (remaining == 2) {
+    uint32_t chunk = ((uint32_t)input[i] << 16) | ((uint32_t)input[i + 1] << 8);
+    output[o++] = standard_base64_chars[(chunk >> 18) & 0x3F];
+    output[o++] = standard_base64_chars[(chunk >> 12) & 0x3F];
+    output[o++] = standard_base64_chars[(chunk >> 6) & 0x3F];
+    output[o++] = '=';
+  }
+
+  outlen = o;
+#endif
+
   // Convert to base64 URL format in-place (replace + with -, / with _, remove padding =)
   for (size_t i = 0; i < outlen; i++) {
     if (output[i] == '+') {
