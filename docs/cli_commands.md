@@ -1329,7 +1329,7 @@ Not available on this build: `wifi.*`, `snmp.*`, `alert.*`, `mqtt.analyzer.*`, `
 
 **Settings storage:** the nRF52-only settings (`mqtt.room.*`, `mqtt.auth.*`) persist in their own `/mqtt_eth_prefs` file, separate from the shared `/mqtt_prefs` file used by `mqtt.iata`, `mqtt1.*`, and the other settings above.
 
-Notes: PubSubClient publishes at QoS 0 everywhere; retained topics are `status`, `room/stats`, `link`, and `auth/*`. Room posts report the room's own timestamp as `client_timestamp`. Reconnect backoff steps through 10 s, 30 s, 60 s, 120 s, then caps at 300 s. While the broker is unreachable, packets are held in a 16-entry ring and room events in an 8-entry ring; when a ring is full the oldest entry is evicted and counted in the drop counters (`drops=` in `get mqtt.status`, `packet_drops` and `event_drops` in `room/stats`). A publish that fails twice in a row is discarded and counted as a publish error (`err=` in `get mqtt.status`, `pub_err` in `get mqtt.stats`), not as a drop.
+Notes: PubSubClient publishes at QoS 0 everywhere; retained topics are `status`, `room/stats`, `link`, and `auth/*`. Room posts report the room's own timestamp as `client_timestamp`. Reconnect backoff steps through 10 s, 30 s, 60 s, 120 s, then caps at 300 s. While the broker is unreachable, packets are held in a 32-entry ring and room events in a 32-entry ring (`MQTT_ETH_PACKET_RING`, `MQTT_ETH_EVENT_RING`); when a ring is full the oldest entry is evicted and counted in the drop counters (`drops=` in `get mqtt.status`, `packet_drops` and `event_drops` in `room/stats`). A publish that fails twice in a row is discarded and counted as a publish error (`err=` in `get mqtt.status`, `pub_err` in `get mqtt.stats`), not as a drop.
 
 ---
 

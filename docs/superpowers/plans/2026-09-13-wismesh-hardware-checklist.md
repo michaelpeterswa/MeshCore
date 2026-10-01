@@ -150,3 +150,21 @@ completed as specified; only this device-dependent soak is outstanding.
 
 ## final-fix-report.md
 
+
+## Results: first hardware session, 2026-09-30, WisMesh Ethernet Gateway (RAK4631 + RAK13800 + PoE)
+
+Broker: mosquitto 2.1.2 on a Mac at 10.0.0.46:1883, anonymous. Device at 10.0.0.174 via DHCP.
+
+Passed as built: DFU flash over serial; DHCP; `link` and `status` with NTP-correct time; `packets` rx/tx with SNR and RSSI; `neighbors`; `auth` token (3-part Ed25519 JWT, retained); system post via `room.post`; settings persist across power cycle; telnet CLI on port 23; every CLI rejection case (TLS preset, wifi.*, interval range, audience wildcard); phone login -> `login_ok` with role; wrong password -> `login_fail`/`bad_password` with no password in the payload; admin login; admin posts; admin CLI commands -> `room/dm` + `admin_cmd` with the reply never logged; `set guest.password`, `set admin.password` and `password` all redacted; NTP against a dead host fails within the bound and the device stays responsive.
+
+Bugs found and fixed (commits ff1aaf6f, c39e41b2, e7abb39d, 1c1d458e):
+1. Hard reset ~1 s after every `auth/*` publish. Loop task stack (fixed 4 KB in the Adafruit core) had 8 bytes free before the JWT was built. Main loop now runs on an 8 KB task; `get mqtt.stats` reports `stack_min_free` (3640 B on this device).
+2. `mqtt.ntp.sync` always failed: the room server callback passes timeout 0.
+3. Cable pull froze the loop for 32.0 s (MQTT DISCONNECT written into a dead socket; W5100S send loop waits for the TCP retransmit timer). Now 0 probe misses at 1 Hz. Chip retransmit budget set to 300 ms x 3.
+4. First reconnect after link-up fired before the switch forwarded frames and cost a 30 s backoff; 2.5 s grace added. Link up 18:44:42, connected 18:44:45.
+
+Broker outage, 45 min with link up: backoff 30/60/120/300 s observed, each failure fast; reconnected on the scheduled attempt first try; drain order link, status, 8 room events, 16 packets, auth; 0 publish errors. 16-slot packet ring overflowed 776 times (expected, busy mesh); 8-slot event ring lost 10 real room events -> both rings raised to 32.
+
+Not exercised: EU-frequency default had to be changed to 910.525/62.5/7/5 for a US companion (board default is 869.618 MHz); consider a US env default. Isolated-LAN-without-NTP long run (only the forced-sync path was tested).
+
+Operator notes: the admin password on the test gateway was changed from the room's admin terminal during the outage test; the room password is still `hello`.

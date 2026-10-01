@@ -19,10 +19,10 @@ class MeshSNMPAgent;  // never instantiated on this build
 #endif
 
 #ifndef MQTT_ETH_PACKET_RING
-  #define MQTT_ETH_PACKET_RING 16
+  #define MQTT_ETH_PACKET_RING 32   // ~530 B each; 16 overflowed in ~80 s on a busy mesh
 #endif
 #ifndef MQTT_ETH_EVENT_RING
-  #define MQTT_ETH_EVENT_RING 8
+  #define MQTT_ETH_EVENT_RING 32    // ~790 B each; 8 lost 10 real room events in a 45 min outage
 #endif
 
 /**
