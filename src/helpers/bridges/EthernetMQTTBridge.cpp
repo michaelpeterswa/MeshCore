@@ -49,7 +49,7 @@ void EthernetMQTTBridge::onPacketReceived(mesh::Packet* packet) {
   if (!_obs->mqtt_rx_enabled) return;
   if (!_obs->mqtt_packets_enabled && !_obs->mqtt_raw_enabled) return;
   if (!typeAllowed(_obs->mqtt_slot_packet_filter[0], packet->getPayloadType())) return;
-  PacketEntry e;
+  static PacketEntry e;   // ~530 bytes; the ring push() copies it, and this runs on the LoRa receive path
   e.blob_len = packet->writeTo(e.blob);
   e.is_tx = false;
   if (_staged_valid) { memcpy(e.raw, _staged_raw, _staged_raw_len); e.raw_len = _staged_raw_len; e.snr = _staged_snr; e.rssi = _staged_rssi; }
@@ -67,7 +67,7 @@ void EthernetMQTTBridge::sendPacket(mesh::Packet* packet) {
   if (!_obs->mqtt_tx_enabled) return;
   if (!_obs->mqtt_packets_enabled && !_obs->mqtt_raw_enabled) return;
   if (!typeAllowed(_obs->mqtt_slot_packet_filter[0], packet->getPayloadType())) return;
-  PacketEntry e;
+  static PacketEntry e;   // ~530 bytes; the ring push() copies it, and this runs on the LoRa receive path
   e.blob_len = packet->writeTo(e.blob);
   e.is_tx = true; e.raw_len = 0; e.snr = 0; e.rssi = 0;
   e.rtc_secs = _rtc->getCurrentTime();
@@ -102,7 +102,7 @@ const char* EthernetMQTTBridge::getSlotPresetName(int) const { return _obs ? _ob
 bool EthernetMQTTBridge::publishRoomTopic(const char* suffix, const char* json, size_t len, bool retain) {
   if (!_initialized || !suffix || !json) return false;
   if (len >= sizeof(EventEntry::json)) return false;
-  EventEntry e;
+  static EventEntry e;    // ~790 bytes; the ring push() copies it, and this runs from room-server hooks
   strncpy(e.suffix, suffix, sizeof(e.suffix) - 1); e.suffix[sizeof(e.suffix) - 1] = 0;
   e.retain = retain; e.len = (uint16_t)len;
   memcpy(e.json, json, len); e.json[len] = 0;
@@ -114,7 +114,8 @@ bool EthernetMQTTBridge::publishNeighbors() {
   if (!_neighbor_source) return false;
   char topic[128];
   if (!topicFor("neighbors", topic, sizeof(topic))) return false;
-  MQTTPayloadBuilder::NeighborsMessageEntry entries[NEIGHBORS_MAX_PUBLISH_ENTRIES];
+  // Static: ~800 bytes would otherwise sit on the 4 KB loop task stack.
+  static MQTTPayloadBuilder::NeighborsMessageEntry entries[NEIGHBORS_MAX_PUBLISH_ENTRIES];
   static char hex_pool[NEIGHBORS_MAX_PUBLISH_ENTRIES * (PUB_KEY_SIZE * 2 + 1)];
   uint32_t now = _rtc->getCurrentTime();
   int n = _neighbor_source->collectNeighbors(entries, NEIGHBORS_MAX_PUBLISH_ENTRIES, hex_pool, sizeof(hex_pool), now);
@@ -141,9 +142,10 @@ bool EthernetMQTTBridge::publishAuthTokens() {
   // then replace _auth_audiences/_auth_issued_at with the parsed list (in
   // parsed order) so a removed or renamed audience loses its timer and a
   // genuinely new one starts at issued_at == 0.
-  char parsed[4][64];
+  // Static scratch: this path also runs the Ed25519 signer; keep the loop task stack flat.
+  static char parsed[4][64];
   int parsed_count = MQTTEthernetPolicy::parseAudiences(_eth->auth_audiences, parsed, 4);
-  uint32_t matched_issued_at[4];
+  static uint32_t matched_issued_at[4];
   for (int i = 0; i < parsed_count; i++) {
     matched_issued_at[i] = 0;
     for (int j = 0; j < _auth_count; j++) {
@@ -176,8 +178,8 @@ bool EthernetMQTTBridge::publishAuthTokens() {
       ETH_MQTT_LOG("jwt failed for %s", _auth_audiences[i]);
       continue;
     }
-    char suffix[80]; snprintf(suffix, sizeof(suffix), "auth/%s", _auth_audiences[i]);
-    char topic[160];
+    static char suffix[80]; snprintf(suffix, sizeof(suffix), "auth/%s", _auth_audiences[i]);
+    static char topic[160];
     if (!topicFor(suffix, topic, sizeof(topic))) continue;
     int len = MQTTEthernetPayloads::buildAuthMessage(_doc, _auth_audiences[i], _device_id, token, now, now + life, _json, sizeof(_json));
     if (len <= 0) continue;
@@ -192,7 +194,7 @@ bool EthernetMQTTBridge::publishAuthTokens() {
 bool EthernetMQTTBridge::drainPacketRing() {
   PacketEntry* e = _packet_ring.front();
   if (!e) return false;
-  mesh::Packet pkt;
+  static mesh::Packet pkt;   // ~300 bytes; readFrom() fully rewrites it each call
   if (!pkt.readFrom(e->blob, e->blob_len)) {
     _packet_ring.pop();
     _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false;

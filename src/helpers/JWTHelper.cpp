@@ -8,6 +8,18 @@
 #include <SHA256.h>
 #include <string.h>
 #include <time.h>
+// On the nRF52 Ethernet observer the caller runs on the Arduino loop task, whose
+// FreeRTOS stack is a fixed 4 KB (Adafruit core LOOP_STACK_SZ). The ~2 KB of
+// scratch buffers below overflowed it: the first token published, then the
+// board hard-reset about a second later, every boot. JWT_STATIC_SCRATCH moves
+// the scratch to static storage; callers must then be single-threaded, which
+// the nRF52 bridge is. ESP32 builds leave this undefined and keep stack locals.
+#if defined(JWT_STATIC_SCRATCH)
+  #define JWT_SCRATCH static
+#else
+  #define JWT_SCRATCH
+#endif
+
 #include "ed_25519.h"
 #if defined(ESP_PLATFORM)
 #include "mbedtls/base64.h"
@@ -37,28 +49,28 @@ bool JWTHelper::createAuthToken(
   }
   
   // Create header
-  char header[256];
+  JWT_SCRATCH char header[256];
   size_t headerLen = createHeader(header, sizeof(header));
   if (headerLen == 0) {
     return false;
   }
   
   // Get public key as UPPERCASE HEX string
-  char publicKeyHex[65];
+  JWT_SCRATCH char publicKeyHex[65];
   mesh::Utils::toHex(publicKeyHex, identity.pub_key, PUB_KEY_SIZE);
   for (int i = 0; publicKeyHex[i]; i++) {
     publicKeyHex[i] = toupper(publicKeyHex[i]);
   }
   
   // Create payload
-  char payload[512];
+  JWT_SCRATCH char payload[512];
   size_t payloadLen = createPayload(publicKeyHex, audience, issuedAt, expiresIn, payload, sizeof(payload), owner, client, email);
   if (payloadLen == 0) {
     return false;
   }
   
   // Create signing input: header.payload
-  char signingInput[768];
+  JWT_SCRATCH char signingInput[768];
   size_t signingInputLen = headerLen + 1 + payloadLen;
   if (signingInputLen >= sizeof(signingInput)) {
     return false;
@@ -69,10 +81,10 @@ bool JWTHelper::createAuthToken(
   memcpy(signingInput + headerLen + 1, payload, payloadLen);
   
   // Sign the data using direct Ed25519 signing
-  uint8_t signature[64];
+  JWT_SCRATCH uint8_t signature[64];
   mesh::LocalIdentity identity_copy = identity;
   
-  uint8_t export_buffer[96];
+  JWT_SCRATCH uint8_t export_buffer[96];
   size_t exported_size = identity_copy.writeTo(export_buffer, sizeof(export_buffer));
   
   if (exported_size != 96) {
@@ -92,7 +104,7 @@ bool JWTHelper::createAuthToken(
   }
   
   // Convert signature to hex
-  char signatureHex[129];
+  JWT_SCRATCH char signatureHex[129];
   for (int i = 0; i < 64; i++) {
     sprintf(signatureHex + (i * 2), "%02X", signature[i]);
   }
@@ -191,7 +203,7 @@ size_t JWTHelper::createHeader(char* output, size_t outputSize) {
   doc["alg"] = "Ed25519";
   doc["typ"] = "JWT";
   
-  char jsonBuffer[256];
+  JWT_SCRATCH char jsonBuffer[256];
   size_t len = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
   if (len == 0 || len >= sizeof(jsonBuffer)) {
     return 0;
@@ -236,7 +248,7 @@ size_t JWTHelper::createPayload(
     doc["email"] = email;
   }
   
-  char jsonBuffer[512];
+  JWT_SCRATCH char jsonBuffer[512];
   size_t len = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
   if (len == 0 || len >= sizeof(jsonBuffer)) {
     return 0;
