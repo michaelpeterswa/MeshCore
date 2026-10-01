@@ -541,9 +541,22 @@ bool EthernetMQTTBridge::syncNtp(uint32_t timeout_ms) {
 }
 
 bool EthernetMQTTBridge::requestForcedNtpSync(uint32_t timeout_ms) {
-  if (timeout_ms > 5000UL) timeout_ms = 5000UL;   // cap regardless of caller's argument
+  // The room server's CLI callback passes 0, which on the ESP32 bridge means
+  // "queue a sync on the MQTT task"; here it must mean "use the default bound",
+  // otherwise syncNtp() sees a zero budget and fails before opening a socket.
+  if (timeout_ms == 0 || timeout_ms > 5000UL) timeout_ms = 5000UL;
   bool ok = syncNtp(timeout_ms);
-  _next_ntp_at = millis() + 3600000UL;
+  if (ok) {
+    _ntp_consec_failures = 0;
+    _next_ntp_at = millis() + 3600000UL;
+  } else {
+    // Same ladder as the periodic path so a manual retry storm cannot defeat it.
+    uint8_t shift = _ntp_consec_failures < 4 ? _ntp_consec_failures : 4;
+    unsigned long delay_ms = 60000UL << shift;
+    if (delay_ms > 900000UL) delay_ms = 900000UL;
+    if (_ntp_consec_failures < 0xFF) _ntp_consec_failures++;
+    _next_ntp_at = millis() + delay_ms;
+  }
   return ok;
 }
 
