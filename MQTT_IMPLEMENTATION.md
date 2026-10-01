@@ -236,7 +236,7 @@ separate nRF52 implementation behind the `MQTTBridge` alias in
 mqtts presets are rejected with a pointer to the LAN proxy. QoS is 0
 everywhere (PubSubClient), and the nRF52-only settings persist in their own
 `/mqtt_eth_prefs` file, separate from the shared `/mqtt_prefs` file. See
-`docs/cli_commands.md` for the CLI subset.
+`docs/cli_commands.md` for the CLI subset. The main loop runs on an 8 KB task on this build because the core's 4 KB loop stack overflowed under the JWT path; see `get mqtt.stats` `stack_min_free`.
 
 **TLora naming:** The env prefix `LilyGo_TLora_V2_1_1_6` is LilyGo’s **T-LoRa V2.1–1.6** board (SX1276); PlatformIO selects **`ttgo-lora32-v1`** (TTGO LoRa32 V1.0). **MQTT observer** envs extend a slim base **without** `sensor_base` so the image fits `min_spiffs`; **all other** `LilyGo_TLora_V2_1_1_6_*` targets still use optional I2C environmental sensors as before. The **`lilygo_tlora_c6`** variant is separate hardware (ESP32-C6).
 

@@ -12,6 +12,8 @@
 #include <string.h>
 #include <math.h>
 
+static int freeHeapBytes();   // defined with the status publisher below
+
 EthernetMQTTBridge* EthernetMQTTBridge::s_instance = nullptr;
 
 EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::PacketManager* mgr,
@@ -178,6 +180,7 @@ bool EthernetMQTTBridge::publishAuthTokens() {
       ETH_MQTT_LOG("jwt failed for %s", _auth_audiences[i]);
       continue;
     }
+    ETH_MQTT_LOG("auth: token built, %u chars", (unsigned)strlen(token));
     static char suffix[80]; snprintf(suffix, sizeof(suffix), "auth/%s", _auth_audiences[i]);
     static char topic[160];
     if (!topicFor(suffix, topic, sizeof(topic))) continue;
@@ -186,6 +189,7 @@ bool EthernetMQTTBridge::publishAuthTokens() {
     bool ok = _client.publish(topic, (const uint8_t*)_json, len, true);
     ok ? _publish_ok++ : _publish_err++;
     if (ok) _auth_issued_at[i] = now;
+    ETH_MQTT_LOG("auth: %s publish %s (%d bytes)", _auth_audiences[i], ok ? "ok" : "FAILED", len);
     return true;   // one token per pass
   }
   return false;
@@ -701,9 +705,13 @@ void EthernetMQTTBridge::formatMqttStatusReply(char* buf, size_t bufsize, const 
 
 void EthernetMQTTBridge::formatMqttStatsReply(char* buf, size_t bufsize) {
   if (!s_instance) { snprintf(buf, bufsize, "> MQTT: bridge not created"); return; }
-  snprintf(buf, bufsize, "> pub_ok=%lu pub_err=%lu reconnects=%lu pkt_drops=%lu evt_drops=%lu",
+  // stack_min_free is the FreeRTOS high-water mark of the task running this CLI
+  // (the main loop task on this build): the fewest bytes of stack ever left free
+  // since boot. The first hardware run overflowed the core's 4 KB loop task here.
+  snprintf(buf, bufsize, "> pub_ok=%lu pub_err=%lu reconnects=%lu pkt_drops=%lu evt_drops=%lu stack_min_free=%u",
            s_instance->_publish_ok, s_instance->_publish_err, (unsigned long)s_instance->_broker_reconnects,
-           (unsigned long)s_instance->packetDrops(), (unsigned long)s_instance->eventDrops());
+           (unsigned long)s_instance->packetDrops(), (unsigned long)s_instance->eventDrops(),
+           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 }
 
 bool EthernetMQTTBridge::getSlotStatusSnapshot(int slot_index, SlotStatusSnapshot* out) {

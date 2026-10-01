@@ -27,6 +27,10 @@ static char command[MAX_POST_TEXT_LEN+1];
 static char ethernet_command[MAX_POST_TEXT_LEN+1];
 #endif
 
+#if defined(WITH_MQTT_BRIDGE_ETHERNET)
+static void startMainLoopTask();
+#endif
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -114,9 +118,13 @@ void setup() {
 #endif
 
   board.onBootComplete();
+
+#if defined(WITH_MQTT_BRIDGE_ETHERNET)
+  startMainLoopTask();
+#endif
 }
 
-void loop() {
+static void mainLoopBody() {
   int len = strlen(command);
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
@@ -171,3 +179,32 @@ void loop() {
   external_watchdog.loop();
 #endif
 }
+
+#if defined(WITH_MQTT_BRIDGE_ETHERNET)
+// The Adafruit nRF52 core runs loop() on a fixed 4096-byte FreeRTOS stack
+// (LOOP_STACK_SZ in the core's main.cpp, not overridable). With the Ethernet
+// MQTT bridge on that task the high-water mark hit 8 bytes free before the
+// first auth token was even built, and the board hard-reset about a second
+// after each token publish. Re-host the whole main loop (radio, CLI, bridge)
+// on one larger task so the single-task design and its SPI ownership stay
+// intact, and park the core's loop task for good.
+#ifndef MAIN_LOOP_STACK_BYTES
+  #define MAIN_LOOP_STACK_BYTES 8192
+#endif
+static void mainLoopTask(void*) {
+  for (;;) {
+    mainLoopBody();
+    yield();
+  }
+}
+static void startMainLoopTask() {
+  xTaskCreate(mainLoopTask, "mainloop", MAIN_LOOP_STACK_BYTES / sizeof(StackType_t), NULL, TASK_PRIO_LOW, NULL);
+}
+void loop() {
+  suspendLoop();   // never returns; mainLoopTask owns the loop from here on
+}
+#else
+void loop() {
+  mainLoopBody();
+}
+#endif
