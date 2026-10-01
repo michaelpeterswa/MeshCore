@@ -152,6 +152,7 @@ private:
   // link + broker state
   bool _link_up;
   unsigned long _link_changed_at;
+  unsigned long _link_up_at;        // for the post-link-up connect grace period
   uint32_t _link_changes;
   unsigned long _last_connect_attempt;
   uint8_t _backoff;

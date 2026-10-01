@@ -20,7 +20,7 @@ EthernetMQTTBridge::EthernetMQTTBridge(NodePrefs* prefs, MQTTPrefs* obs, mesh::P
                                        mesh::RTCClock* rtc, mesh::LocalIdentity* identity)
   : BridgeBase(prefs, mgr, rtc), _obs(obs), _eth(nullptr), _identity(identity),
     _dispatcher(nullptr), _radio(nullptr), _board(nullptr), _ms(nullptr), _neighbor_source(nullptr),
-    _client(_net), _link_up(false), _link_changed_at(0), _link_changes(0),
+    _client(_net), _link_up(false), _link_changed_at(0), _link_up_at(0), _link_changes(0),
     _last_connect_attempt(0), _backoff(0), _broker_reconnects(0),
     _link_gate(nullptr), _ntp_consec_failures(0),
     _broker_ip((uint32_t)0), _ntp_ip((uint32_t)0), _outage_started_at(0),
@@ -307,11 +307,26 @@ void EthernetMQTTBridge::refreshLink(unsigned long now) {
     _link_changes++;
     ETH_MQTT_LOG("link %s", up ? "up" : "down");
     if (!up) {
-      if (_client.connected()) _client.disconnect();
+      // Do NOT send an MQTT DISCONNECT here: the peer can no longer ACK, and
+      // the W5100S send loop spins until the chip's TCP retransmit timer closes
+      // the socket (measured: 32 s with the cable pulled, LoRa unserviced the
+      // whole time). Drop the TCP socket locally instead; EthernetClient::stop()
+      // is bounded by the connection timeout and then force-closes.
+      _net.stop();
       onDisconnected(now);
     } else {
-      // Cable/DHCP just came back: reconnect immediately instead of waiting
-      // out whatever backoff accumulated during the outage.
+      // Bound every TCP send against a peer that stops answering (cable pulled
+      // mid-publish, broker host gone): the library's default retransmit budget
+      // lets socketSend() block for tens of seconds. These are chip registers,
+      // so re-apply on every link-up in case the DHCP task re-initialized them.
+      Ethernet.setRetransmissionTimeout(300);
+      Ethernet.setRetransmissionCount(3);
+      // Cable/DHCP just came back: reconnect promptly instead of waiting out
+      // whatever backoff accumulated during the outage. connectBroker() holds
+      // off for kLinkUpGraceMs first: the PHY reports link a second or two
+      // before the switch forwards frames, and a SYN sent in that window fails
+      // (measured: rc=-2) and would otherwise cost a 30 s backoff step.
+      _link_up_at = now;
       _backoff = 0;
       _last_connect_attempt = 0;
     }
@@ -388,7 +403,7 @@ void EthernetMQTTBridge::begin() {
 }
 
 void EthernetMQTTBridge::end() {
-  if (_client.connected()) _client.disconnect();
+  if (_link_up && _client.connected()) _client.disconnect(); else _net.stop();
   _slot_state = "inactive";
   _initialized = false;
 }
@@ -431,8 +446,11 @@ static void resolveBroker(const MQTTPrefs* obs, char* host, size_t host_size, ui
   }
 }
 
+static const unsigned long kLinkUpGraceMs = 2500;
+
 bool EthernetMQTTBridge::connectBroker(unsigned long now) {
   if (!isConfigValid(_obs)) { _slot_state = "inactive"; return false; }
+  if (_link_up_at != 0 && (unsigned long)(now - _link_up_at) < kLinkUpGraceMs) return false;
   if (!MQTTConnectionPolicy::reconnectDue((uint32_t)now, (uint32_t)_last_connect_attempt, _backoff, 0)
       && _last_connect_attempt != 0) {
     return false;
@@ -742,7 +760,7 @@ void EthernetMQTTBridge::setSlotPreset(int slot_index, const char* preset_name) 
   if (slot_index != 0 || !preset_name) return;
   strncpy(_obs->mqtt_slot_preset[0], preset_name, sizeof(_obs->mqtt_slot_preset[0]) - 1);
   _obs->mqtt_slot_preset[0][sizeof(_obs->mqtt_slot_preset[0]) - 1] = 0;
-  if (_client.connected()) _client.disconnect();
+  if (_link_up && _client.connected()) _client.disconnect(); else _net.stop();
   _backoff = 0; _last_connect_attempt = 0;
   _broker_ip = IPAddress((uint32_t)0);   // preset/host may have changed; force re-resolve
 }
