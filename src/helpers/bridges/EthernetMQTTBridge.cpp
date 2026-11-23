@@ -58,6 +58,8 @@ void EthernetMQTTBridge::onPacketReceived(mesh::Packet* packet) {
   else { e.raw_len = 0; e.snr = 0; e.rssi = 0; }
   _staged_valid = false;
   e.rtc_secs = _rtc->getCurrentTime();
+  e.captured_ms = (uint32_t)millis();
+  e.captured_synced = _time_synced;
   // If this push overwrites the current front (ring was full), any in-flight
   // per-topic progress for that dropped entry is now stale: reset it so the
   // next drainPacketRing() call starts the new front cleanly.
@@ -73,6 +75,8 @@ void EthernetMQTTBridge::sendPacket(mesh::Packet* packet) {
   e.blob_len = packet->writeTo(e.blob);
   e.is_tx = true; e.raw_len = 0; e.snr = 0; e.rssi = 0;
   e.rtc_secs = _rtc->getCurrentTime();
+  e.captured_ms = (uint32_t)millis();
+  e.captured_synced = _time_synced;
   if (_packet_ring.push(e)) { _front_packets_done = false; _front_raw_done = false; _packet_retry_pending = false; }
 }
 
@@ -206,6 +210,10 @@ bool EthernetMQTTBridge::drainPacketRing() {
   }
   long usec = 0;
   char topic[128];
+  // A packet queued before the first NTP sync carries the boot-default RTC;
+  // re-derive it from its age now that the clock may be right.
+  time_t when = (time_t)MQTTEthernetPolicy::packetCaptureSecs(e->rtc_secs, e->captured_synced, e->captured_ms,
+                                                               _rtc->getCurrentTime(), _time_synced, (uint32_t)millis());
 
   // Each topic is tracked independently so a partial success (one topic
   // publishes, the other fails) never republishes the already-succeeded
@@ -215,10 +223,10 @@ bool EthernetMQTTBridge::drainPacketRing() {
       int len;
       if (!e->is_tx && e->raw_len > 0) {
         len = MQTTMessageBuilder::buildPacketJSONFromRawAt(_doc, e->raw, e->raw_len, &pkt, false, _origin, _device_id,
-                                                            e->snr, e->rssi, NAN, nullptr, (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+                                                            e->snr, e->rssi, NAN, nullptr, when, usec, _json, sizeof(_json));
       } else {
         len = MQTTMessageBuilder::buildPacketJSONAt(_doc, &pkt, e->is_tx, _origin, _device_id, nullptr,
-                                                     (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+                                                     when, usec, _json, sizeof(_json));
       }
       if (len > 0) {
         bool ok = _client.publish(topic, (const uint8_t*)_json, len, false);
@@ -238,7 +246,7 @@ bool EthernetMQTTBridge::drainPacketRing() {
   if (_obs->mqtt_raw_enabled && !_front_raw_done) {
     if (topicFor("raw", topic, sizeof(topic))) {
       int len = MQTTMessageBuilder::buildRawJSONAt(_doc, &pkt, _origin, _device_id, nullptr,
-                                                    (time_t)e->rtc_secs, usec, _json, sizeof(_json));
+                                                    when, usec, _json, sizeof(_json));
       if (len > 0) {
         bool ok = _client.publish(topic, (const uint8_t*)_json, len, false);
         if (ok) { _publish_ok++; _front_raw_done = true; }
@@ -669,6 +677,30 @@ bool EthernetMQTTBridge::publishLink() {
 
 // ---- Step 5: loop ----
 
+// NTP needs only the link, not the broker: gating it on a broker connection
+// left the RTC at its boot default for as long as the broker was unreachable,
+// and every packet captured in that time was stamped 2024.
+bool EthernetMQTTBridge::runNtpIfDue(unsigned long now) {
+  if ((long)(now - _next_ntp_at) < 0) return false;
+  // Same post-link-up hold-off as connectBroker(): a query sent before the
+  // switch forwards frames fails and would cost a 60 s backoff step.
+  if (_link_up_at != 0 && (unsigned long)(now - _link_up_at) < kLinkUpGraceMs) return false;
+  if (syncNtp(2000)) {
+    _ntp_consec_failures = 0;
+    _next_ntp_at = now + 3600000UL;
+  } else {
+    // I4: exponential backoff (60s, 120s, 240s, ... capped at 900s) instead
+    // of retrying every 60s forever when NTP is unreachable (e.g. an
+    // isolated LAN with no route to the internet default).
+    uint8_t shift = _ntp_consec_failures < 4 ? _ntp_consec_failures : 4;
+    uint32_t delay_ms = 60000UL << shift;
+    if (delay_ms > 900000UL) delay_ms = 900000UL;
+    _next_ntp_at = now + delay_ms;
+    if (_ntp_consec_failures < 0xFF) _ntp_consec_failures++;
+  }
+  return true;
+}
+
 void EthernetMQTTBridge::loop() {
   if (!_initialized) return;
   unsigned long now = millis();
@@ -677,27 +709,12 @@ void EthernetMQTTBridge::loop() {
 
   if (!_client.connected()) {
     if (_slot_state[0] == 'o') onDisconnected(now);
+    if (runNtpIfDue(now)) return;
     if (!connectBroker(now)) return;
   }
   _client.loop();
 
-  if ((long)(now - _next_ntp_at) >= 0) {
-    bool synced_now = syncNtp(2000);
-    if (synced_now) {
-      _ntp_consec_failures = 0;
-      _next_ntp_at = now + 3600000UL;
-    } else {
-      // I4: exponential backoff (60s, 120s, 240s, ... capped at 900s) instead
-      // of retrying every 60s forever when NTP is unreachable (e.g. an
-      // isolated LAN with no route to the internet default).
-      uint8_t shift = _ntp_consec_failures < 4 ? _ntp_consec_failures : 4;
-      uint32_t delay_ms = 60000UL << shift;
-      if (delay_ms > 900000UL) delay_ms = 900000UL;
-      _next_ntp_at = now + delay_ms;
-      if (_ntp_consec_failures < 0xFF) _ntp_consec_failures++;
-    }
-    return;   // one unit of work per pass
-  }
+  if (runNtpIfDue(now)) return;   // one unit of work per pass
   if ((long)(now - _next_link_at) >= 0) {
     publishLink();
     _next_link_at = now + MQTTEthernetPolicy::linkPublishIntervalMs();

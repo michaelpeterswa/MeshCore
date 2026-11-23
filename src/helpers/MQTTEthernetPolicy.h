@@ -53,6 +53,19 @@ static inline bool tokenRenewalDue(uint32_t now_secs, uint32_t issued_at, uint32
 
 static inline uint32_t linkPublishIntervalMs() { return kLinkPublishIntervalMs; }
 
+// Timestamp to publish for a queued packet. The RTC boots at a fixed default
+// (2024-05-15) and is only corrected by the first NTP sync, so a packet
+// captured before then carries a time two years stale. Once the clock is
+// synced, re-derive such a packet's time from how long ago it was captured on
+// the monotonic millis() clock (wrap-safe for any age under ~49 days; the ring
+// never holds an entry that long). Elapsed time rounds down: the packet is at
+// least that old. Packets captured after a sync keep their captured time.
+static inline uint32_t packetCaptureSecs(uint32_t captured_rtc, bool captured_synced, uint32_t captured_ms,
+                                         uint32_t now_rtc, bool now_synced, uint32_t now_ms) {
+  if (captured_synced || !now_synced) return captured_rtc;
+  return now_rtc - (uint32_t)(now_ms - captured_ms) / 1000UL;
+}
+
 // The audience is placed directly into an MQTT topic segment (see
 // RoomLogPublisher/JWTHelper), so '+'/'#' (MQTT wildcard characters) or a
 // control byte would let a device-signed PUBLISH topic be mistaken for a

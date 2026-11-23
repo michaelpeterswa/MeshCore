@@ -109,3 +109,30 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// A packet captured before the first NTP sync carries the boot-default RTC
+// (2024-05-15 + uptime). Once synced, its time is re-derived from how long ago
+// it was captured on the monotonic millis() clock.
+TEST(MQTTEthernetPolicy, CaptureTimeKeptWhenCapturedSynced) {
+  EXPECT_EQ(1795400000u, P::packetCaptureSecs(1795400000u, true, 5000u, 1795400100u, true, 105000u));
+}
+
+TEST(MQTTEthernetPolicy, CaptureTimeRederivedWhenCapturedBeforeSync) {
+  // Captured at boot-default time, 90 s before the publish that follows the sync.
+  EXPECT_EQ(1795400010u, P::packetCaptureSecs(1715850000u, false, 10000u, 1795400100u, true, 100000u));
+}
+
+TEST(MQTTEthernetPolicy, CaptureTimeRoundsElapsedDownToWholeSeconds) {
+  // 1999 ms elapsed: the packet is at least 1 s old, not 2 s.
+  EXPECT_EQ(1795400099u, P::packetCaptureSecs(1715850000u, false, 98001u, 1795400100u, true, 100000u));
+}
+
+TEST(MQTTEthernetPolicy, CaptureTimeLeftAloneWhileStillUnsynced) {
+  // No NTP yet (isolated LAN): nothing better to offer than the raw RTC.
+  EXPECT_EQ(1715850000u, P::packetCaptureSecs(1715850000u, false, 10000u, 1715850090u, false, 100000u));
+}
+
+TEST(MQTTEthernetPolicy, CaptureTimeElapsedIsWrapSafe) {
+  // millis() wrapped between capture and publish: 0xFFFFF000 -> 0x00001000 is 8192 ms.
+  EXPECT_EQ(1795400092u, P::packetCaptureSecs(1715850000u, false, 0xFFFFF000u, 1795400100u, true, 0x00001000u));
+}

@@ -119,6 +119,8 @@ public:
     float snr;
     float rssi;
     uint32_t rtc_secs;
+    uint32_t captured_ms;           // millis() at capture, to re-derive rtc_secs after the first NTP sync
+    bool captured_synced;           // RTC was NTP-synced at capture
   };
   struct EventEntry {
     char suffix[16];
@@ -230,4 +232,5 @@ private:
   bool drainPacketRing();
   bool drainEventRing();
   bool syncNtp(uint32_t timeout_ms);
+  bool runNtpIfDue(unsigned long now);   // true if it ran (one unit of work)
 };
