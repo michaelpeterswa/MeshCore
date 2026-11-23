@@ -29,10 +29,11 @@ type fakeSession struct {
 	done chan struct{}
 }
 
-func (f *fakeSession) Enqueue(m upstream.Message) {
+func (f *fakeSession) Enqueue(m upstream.Message) bool {
 	f.mu.Lock()
 	f.msgs = append(f.msgs, m)
 	f.mu.Unlock()
+	return true
 }
 func (f *fakeSession) Run(ctx context.Context) {
 	select {
@@ -243,5 +244,37 @@ func TestFinishedSessionIsReplacedOnNextMessage(t *testing.T) {
 			t.Fatal("finished session not replaced")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type closedOnce struct {
+	fakeSession
+	refused bool
+}
+
+func (c *closedOnce) Enqueue(m upstream.Message) bool {
+	if !c.refused {
+		c.refused = true
+		return false
+	}
+	return c.fakeSession.Enqueue(m)
+}
+
+func TestRefusedEnqueueGoesToAFreshSession(t *testing.T) {
+	// A session that has just decided to exit refuses the message; the router
+	// must hand it to a new session instead of losing it.
+	h := newHarness(t, passUp())
+	var made []*closedOnce
+	h.r.newSession = func(u config.Upstream, device string) sessionRunner {
+		c := &closedOnce{fakeSession: fakeSession{done: make(chan struct{})}}
+		if len(made) > 0 {
+			c.refused = true // only the first session refuses
+		}
+		made = append(made, c)
+		return c
+	}
+	h.r.Handle(base+"packets", []byte(`{}`), false)
+	if len(made) != 2 || len(made[1].topics()) != 1 {
+		t.Fatalf("sessions %d", len(made))
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"log/slog"
 	"math/big"
 	"net"
@@ -42,6 +43,12 @@ type Options struct {
 	Addr string
 	// CA reuses another broker's CA so a restarted broker keeps the same trust root.
 	CA *CA
+	// KickAfterConnect accepts CONNECT then immediately drops the client.
+	KickAfterConnect bool
+	// KickOnPublish drops a client that publishes to this topic.
+	KickOnPublish string
+	// DenySubscribe refuses every SUBSCRIBE (SUBACK failure code).
+	DenySubscribe bool
 }
 
 type Received struct {
@@ -64,6 +71,7 @@ type Broker struct {
 	received  []Received
 	logins    []string // "user:pass" for every attempt
 	auth      func(u, p string) bool
+	opts      Options
 }
 
 func Start(t *testing.T, o Options) *Broker {
@@ -77,7 +85,7 @@ func Start(t *testing.T, o Options) *Broker {
 		addr = l.Addr().String()
 		l.Close()
 	}
-	b := &Broker{Addr: addr, auth: o.Auth}
+	b := &Broker{Addr: addr, auth: o.Auth, opts: o}
 	srv := mqtt.New(&mqtt.Options{InlineClient: true, Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))})
 	if err := srv.AddHook(&hook{b: b}, nil); err != nil {
 		t.Fatal(err)
@@ -155,7 +163,7 @@ type hook struct {
 
 func (h *hook) ID() string { return "testbroker" }
 func (h *hook) Provides(x byte) bool {
-	return bytes.Contains([]byte{mqtt.OnConnectAuthenticate, mqtt.OnACLCheck, mqtt.OnPublished}, []byte{x})
+	return bytes.Contains([]byte{mqtt.OnConnectAuthenticate, mqtt.OnACLCheck, mqtt.OnPublished, mqtt.OnSessionEstablished, mqtt.OnPublish}, []byte{x})
 }
 func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	if cl.Net.Inline {
@@ -168,7 +176,21 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	h.b.mu.Unlock()
 	return auth == nil || auth(u, p)
 }
-func (h *hook) OnACLCheck(*mqtt.Client, string, bool) bool { return true }
+func (h *hook) OnACLCheck(cl *mqtt.Client, _ string, write bool) bool {
+	return write || cl.Net.Inline || !h.b.opts.DenySubscribe
+}
+func (h *hook) OnSessionEstablished(cl *mqtt.Client, _ packets.Packet) {
+	if h.b.opts.KickAfterConnect && !cl.Net.Inline {
+		go cl.Stop(errors.New("testbroker: kicked after connect"))
+	}
+}
+func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	if h.b.opts.KickOnPublish != "" && pk.TopicName == h.b.opts.KickOnPublish && !cl.Net.Inline {
+		cl.Stop(errors.New("testbroker: kicked on publish"))
+		return pk, packets.ErrRejectPacket
+	}
+	return pk, nil
+}
 func (h *hook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
 	if cl.Net.Inline {
 		return

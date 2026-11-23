@@ -74,6 +74,7 @@ upstreams:
   - name: letsmesh-us
     preset: analyzer-us
     url: %s
+    audience: mqtt-us-v1.letsmesh.net
     ca_file: %s
   - name: meshrank
     preset: meshrank

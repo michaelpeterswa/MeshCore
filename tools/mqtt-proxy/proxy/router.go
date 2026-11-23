@@ -18,7 +18,7 @@ import (
 )
 
 type sessionRunner interface {
-	Enqueue(upstream.Message)
+	Enqueue(upstream.Message) bool
 	Run(ctx context.Context)
 	Done() <-chan struct{}
 }
@@ -121,9 +121,11 @@ func (r *Router) Handle(topic string, payload []byte, retained bool) {
 			}
 			r.clearWarn(key)
 		}
-		r.session(tg.u, t.Device).Enqueue(upstream.Message{
-			Topic: tg.route.Topic, Payload: payload, QoS: tg.route.QoS, Retain: tg.route.Retain,
-		})
+		msg := upstream.Message{Topic: tg.route.Topic, Payload: payload, QoS: tg.route.QoS, Retain: tg.route.Retain}
+		// A session that has just gone idle refuses; the retry gets a new one.
+		if s := r.session(tg.u, t.Device, nil); !s.Enqueue(msg) {
+			r.session(tg.u, t.Device, s).Enqueue(msg)
+		}
 	}
 }
 
@@ -139,11 +141,12 @@ func (r *Router) handleAuth(t policy.Topic, aud string, payload []byte) {
 }
 
 // session returns the live session for device on u, starting one if needed.
-func (r *Router) session(u config.Upstream, device string) sessionRunner {
+// stale, if non-nil, is a session that refused a message and must be replaced.
+func (r *Router) session(u config.Upstream, device string, stale sessionRunner) sessionRunner {
 	key := device + "|" + u.Name
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if s, ok := r.sessions[key]; ok {
+	if s, ok := r.sessions[key]; ok && s != stale {
 		select {
 		case <-s.Done():
 		default:

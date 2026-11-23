@@ -41,11 +41,13 @@ func jwtSession(b *testbroker.Broker, c *tokens.Cache, s config.Session, hooks H
 			return tok.ExpiresAt
 		},
 		Session: s,
-		Logger:  slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		Logger:  slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: testLogLevel})),
 		Hooks:   hooks,
 		backoff: &Backoff{Min: 50 * time.Millisecond, Max: 200 * time.Millisecond, Jitter: 0},
 	})
 }
+
+var testLogLevel = slog.LevelWarn
 
 var defSession = config.Session{IdleTimeout: time.Minute, RenewBefore: 10 * time.Minute, QueueSize: 256}
 
@@ -212,4 +214,99 @@ func TestUntrustedCertificateRefused(t *testing.T) {
 	if len(b.Logins()) != 0 || len(b.Received()) != 0 {
 		t.Fatal("connected to a broker with an untrusted certificate")
 	}
+}
+
+func TestConnectThenDropIsRateLimited(t *testing.T) {
+	// A broker that accepts CONNECT then drops the client (post-CONNACK auth,
+	// duplicate client ID) must not cause a reconnect storm.
+	b := testbroker.Start(t, testbroker.Options{Kind: testbroker.WSS, KickAfterConnect: true})
+	c := tokens.New(time.Now)
+	putToken(t, c, "jwt-a", time.Now().Add(-time.Minute), time.Now().Add(24*time.Hour))
+	s := jwtSession(b, c, defSession, Hooks{})
+	run(t, s)
+	// A live gateway keeps sending, so there is always something to publish.
+	stop := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(stop) {
+		s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/packets", Payload: []byte(`{}`)})
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Backoff 50ms doubling to 200ms allows ~9 attempts in 1.5s; a storm is hundreds.
+	if n := len(b.Logins()); n < 2 || n > 12 {
+		t.Fatalf("%d connects in 1.5s", n)
+	}
+}
+
+func TestPoisonMessageDroppedAfterRetries(t *testing.T) {
+	poison := "meshcore/SEA/" + dev + "/packets"
+	b := testbroker.Start(t, testbroker.Options{Kind: testbroker.WSS, KickOnPublish: poison})
+	c := tokens.New(time.Now)
+	putToken(t, c, "jwt-a", time.Now().Add(-time.Minute), time.Now().Add(24*time.Hour))
+	var dropped atomic.Int64
+	s := jwtSession(b, c, defSession, Hooks{Dropped: func(reason string) {
+		if reason == "publish_failed" {
+			dropped.Add(1)
+		}
+	}})
+	run(t, s)
+	s.Enqueue(Message{Topic: poison, Payload: []byte(`{}`), QoS: 1})
+	s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/status", Payload: []byte(`{}`), QoS: 1})
+	b.WaitFor(t, 10*time.Second, "status after the poison message", func(r []testbroker.Received) bool {
+		for _, m := range r {
+			if strings.HasSuffix(m.Topic, "/status") {
+				return true
+			}
+		}
+		return false
+	})
+	if d := dropped.Load(); d != 1 {
+		t.Fatalf("publish_failed drops %d", d)
+	}
+}
+
+func TestEnqueueAfterIdleExitIsRefused(t *testing.T) {
+	b := testbroker.Start(t, testbroker.Options{Kind: testbroker.WSS})
+	c := tokens.New(time.Now)
+	putToken(t, c, "jwt-a", time.Now().Add(-time.Minute), time.Now().Add(24*time.Hour))
+	s := jwtSession(b, c, config.Session{IdleTimeout: 100 * time.Millisecond, RenewBefore: time.Minute, QueueSize: 8}, Hooks{})
+	run(t, s)
+	if !s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/packets", Payload: []byte(`{}`)}) {
+		t.Fatal("live session refused a message")
+	}
+	<-s.Done()
+	if s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/packets", Payload: []byte(`{}`)}) {
+		t.Fatal("finished session accepted a message it will never send")
+	}
+}
+
+func TestIdleWhileWaitingForTokenEndsRun(t *testing.T) {
+	// An offline device's session must not linger forever on a queue it cannot send.
+	b := testbroker.Start(t, testbroker.Options{Kind: testbroker.WSS})
+	c := tokens.New(time.Now)
+	s := jwtSession(b, c, config.Session{IdleTimeout: 200 * time.Millisecond, RenewBefore: time.Minute, QueueSize: 8}, Hooks{})
+	run(t, s)
+	s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/packets", Payload: []byte(`{}`)})
+	select {
+	case <-s.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("session waiting for a token never went idle")
+	}
+}
+
+func TestUserPassRefusedOnceRecovers(t *testing.T) {
+	var attempts atomic.Int64
+	b := testbroker.Start(t, testbroker.Options{Kind: testbroker.TLS, Auth: func(u, p string) bool {
+		return attempts.Add(1) > 1 // refuse the first login (auth backend reload, password rotation)
+	}})
+	s := NewSession(SessionConfig{
+		Upstream: config.Upstream{Name: "private", CAFile: b.CAFile,
+			Preset: presets.Preset{Name: "custom", URL: b.URL, Auth: presets.AuthUserPass, Username: "u", Password: "p"}},
+		Device:  dev,
+		Creds:   StaticCredentials("u", "p"),
+		Session: defSession,
+		Logger:  slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+		backoff: &Backoff{Min: 50 * time.Millisecond, Max: 200 * time.Millisecond},
+	})
+	run(t, s)
+	s.Enqueue(Message{Topic: "meshcore/SEA/" + dev + "/status", Payload: []byte(`{}`), QoS: 1})
+	b.WaitFor(t, 5*time.Second, "status after a refused login", func(r []testbroker.Received) bool { return len(r) == 1 })
 }

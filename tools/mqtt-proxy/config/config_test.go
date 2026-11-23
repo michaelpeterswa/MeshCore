@@ -134,6 +134,7 @@ upstreams:
   - name: fake-letsmesh
     preset: analyzer-us
     url: wss://127.0.0.1:8443/mqtt
+    audience: mqtt-us-v1.letsmesh.net
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -182,5 +183,21 @@ func TestErrors(t *testing.T) {
 				t.Fatalf("err = %v, want mention of %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestJWTPresetURLOverrideNeedsAudience(t *testing.T) {
+	// Pointing a JWT preset elsewhere without naming the audience would hand
+	// that host a live token for the preset's real analyzer.
+	_, err := Load(write(t, `
+local:
+  broker: tcp://mosquitto:1883
+upstreams:
+  - name: x
+    preset: analyzer-us
+    url: wss://typo.example/mqtt
+`))
+	if err == nil || !strings.Contains(err.Error(), "audience") {
+		t.Fatalf("err = %v", err)
 	}
 }

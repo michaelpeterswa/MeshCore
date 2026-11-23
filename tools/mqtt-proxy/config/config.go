@@ -152,6 +152,12 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("%s: needs a preset or url", where)
 		}
 		// Overrides apply to presets too (tests, private mirrors of a preset).
+		// Pointing a JWT preset at another host must name the audience: the
+		// device token for the preset's own audience is a live credential
+		// for that analyzer and must not be sent anywhere else by accident.
+		if ru.Preset != "" && ru.URL != "" && p.Auth == presets.AuthJWT && ru.Audience == "" {
+			return nil, fmt.Errorf("%s: url overrides JWT preset %q; set audience explicitly (the preset's is %q)", where, ru.Preset, p.Audience)
+		}
 		if ru.URL != "" {
 			p.URL = ru.URL
 		}

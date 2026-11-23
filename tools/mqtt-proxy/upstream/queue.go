@@ -11,6 +11,8 @@ type Message struct {
 	Payload []byte
 	QoS     byte
 	Retain  bool
+
+	attempts int // failed publishes so far; see maxPublishAttempts
 }
 
 // Queue is a bounded FIFO that drops its oldest entry when full, so a long

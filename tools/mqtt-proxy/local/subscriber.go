@@ -3,6 +3,8 @@ package local
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -19,7 +21,8 @@ type Handler func(topic string, payload []byte, retained bool)
 
 // Run connects to the local broker, subscribes to Filter (again after every
 // reconnect) and passes messages to h until ctx ends. connected reports
-// connection state changes.
+// connection state changes. It returns an error if the broker refuses the
+// subscription, so the process can exit and be restarted.
 func Run(ctx context.Context, cfg config.Local, h Handler, connected func(bool), log *slog.Logger) error {
 	broker := cfg.Broker
 	broker = strings.Replace(broker, "mqtt://", "tcp://", 1)
@@ -38,17 +41,28 @@ func Run(ctx context.Context, cfg config.Local, h Handler, connected func(bool),
 		opts.SetUsername(cfg.Username)
 		opts.SetPassword(cfg.Password)
 	}
+	fatal := make(chan error, 1)
 	opts.SetOnConnectHandler(func(c paho.Client) {
 		tok := c.Subscribe(Filter, 1, func(_ paho.Client, m paho.Message) {
 			h(m.Topic(), m.Payload(), m.Retained())
 		})
-		if tok.WaitTimeout(10*time.Second) && tok.Error() == nil {
+		err := tok.Error()
+		if !tok.WaitTimeout(10 * time.Second) {
+			err = errors.New("timed out")
+		} else if st, ok := tok.(*paho.SubscribeToken); ok && err == nil && st.Result()[Filter] >= 0x80 {
+			err = fmt.Errorf("broker refused (code 0x%02x)", st.Result()[Filter])
+		}
+		if err == nil {
 			log.Info("local broker connected", "broker", cfg.Broker, "filter", Filter)
 			connected(true)
 			return
 		}
-		log.Error("local subscribe failed; reconnecting", "err", tok.Error())
-		c.Disconnect(0) // the auto-reconnect resubscribes
+		// Connected but deaf: exit so the orchestrator restarts us, rather
+		// than sit on a session that receives nothing.
+		select {
+		case fatal <- fmt.Errorf("local subscribe %s: %w", Filter, err):
+		default:
+		}
 	})
 	opts.SetConnectionLostHandler(func(_ paho.Client, err error) {
 		log.Warn("local broker connection lost", "err", err)
@@ -56,8 +70,12 @@ func Run(ctx context.Context, cfg config.Local, h Handler, connected func(bool),
 	})
 	client := paho.NewClient(opts)
 	client.Connect() // retries in the background until ctx ends
-	<-ctx.Done()
+	var err error
+	select {
+	case <-ctx.Done():
+	case err = <-fatal:
+	}
 	client.Disconnect(500)
 	connected(false)
-	return nil
+	return err
 }

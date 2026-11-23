@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +57,16 @@ type SessionConfig struct {
 	backoff *Backoff // tests shorten it
 }
 
+const (
+	// A connection must stay up this long, or deliver a message, before the
+	// reconnect backoff resets. Without it a broker that accepts CONNECT and
+	// then drops the client gets reconnected to as fast as TLS allows.
+	stableAfter = 30 * time.Second
+	// A message whose publish fails this many times is dropped, so one the
+	// broker always disconnects on cannot wedge the queue.
+	maxPublishAttempts = 3
+)
+
 // Session is one device's connection to one upstream. It connects lazily,
 // forwards its queue, and ends after Session.IdleTimeout without traffic.
 type Session struct {
@@ -65,6 +76,13 @@ type Session struct {
 	lastSeen atomic.Int64 // unix nanos of the last Enqueue
 	log      *slog.Logger
 	backoff  *Backoff
+
+	// mu makes "decide to exit" and Enqueue mutually exclusive: once closed
+	// is set, Enqueue refuses, and the router starts a fresh session instead
+	// of handing a message to one that will never send it.
+	mu        sync.Mutex
+	closed    bool
+	connected atomic.Bool
 }
 
 func NewSession(cfg SessionConfig) *Session {
@@ -82,17 +100,55 @@ func NewSession(cfg SessionConfig) *Session {
 	return s
 }
 
-func (s *Session) Enqueue(m Message) {
+// Enqueue queues m, or returns false if the session has finished and m
+// must go to a new one.
+func (s *Session) Enqueue(m Message) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	s.lastSeen.Store(time.Now().UnixNano())
 	if s.q.Push(m) && s.cfg.Hooks.Dropped != nil {
 		s.cfg.Hooks.Dropped("queue_full")
 	}
+	return true
 }
 
 func (s *Session) Done() <-chan struct{} { return s.done }
 
-func (s *Session) idle() bool {
-	return s.q.Len() == 0 && time.Since(time.Unix(0, s.lastSeen.Load())) >= s.cfg.Session.IdleTimeout
+// tryClose ends the session if it has been idle: no Enqueue for
+// IdleTimeout and, while connected, nothing left to send. A session that is
+// not connected (waiting for a token, backing off) goes idle on time alone:
+// its queue is undeliverable and would otherwise keep it alive forever.
+func (s *Session) tryClose() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return true
+	}
+	if time.Since(time.Unix(0, s.lastSeen.Load())) < s.cfg.Session.IdleTimeout {
+		return false
+	}
+	if s.connected.Load() && s.q.Len() > 0 {
+		return false
+	}
+	if n := s.q.Len(); n > 0 {
+		s.log.Info("dropping queued messages from an idle, disconnected session", "count", n)
+		if s.cfg.Hooks.Dropped != nil {
+			for i := 0; i < n; i++ {
+				s.cfg.Hooks.Dropped("idle_undelivered")
+			}
+		}
+	}
+	s.closed = true
+	return true
+}
+
+func (s *Session) markClosed() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 // poll bounds how long any wait lasts before re-checking idleness.
@@ -126,7 +182,7 @@ func (s *Session) wait(ctx context.Context, d time.Duration, ch <-chan struct{})
 		case <-ch:
 			return nil
 		case <-tick.C:
-			if s.idle() {
+			if s.tryClose() {
 				return errIdle
 			}
 		}
@@ -135,9 +191,10 @@ func (s *Session) wait(ctx context.Context, d time.Duration, ch <-chan struct{})
 
 func (s *Session) Run(ctx context.Context) {
 	defer close(s.done)
+	defer s.markClosed()
 	everConnected := false
 	for {
-		if ctx.Err() != nil || s.idle() {
+		if ctx.Err() != nil || s.tryClose() {
 			return
 		}
 		var changed <-chan struct{}
@@ -153,15 +210,25 @@ func (s *Session) Run(ctx context.Context) {
 			continue
 		}
 
-		client, err := s.connect(user, pass)
+		client, lost, err := s.connect(user, pass)
 		if err != nil {
 			if errors.Is(err, packets.ErrorRefusedBadUsernameOrPassword) || errors.Is(err, packets.ErrorRefusedNotAuthorised) {
 				exp := ""
 				if s.cfg.TokenExpiry != nil {
 					exp = s.cfg.TokenExpiry().UTC().Format(time.RFC3339)
 				}
-				s.log.Error("upstream rejected credentials; waiting for a new token", "err", err, "token_exp", exp)
-				if s.wait(ctx, 0, changed) != nil { // non-JWT: changed is nil, waits until idle/ctx
+				if changed != nil {
+					s.log.Error("upstream rejected the device token; waiting for a new one", "err", err, "token_exp", exp)
+					if s.wait(ctx, 0, changed) != nil {
+						return
+					}
+					continue
+				}
+				// Fixed credentials: the broker may be mid-reload or the
+				// password mid-rotation. Retry at the slowest backoff.
+				d := s.backoff.Max
+				s.log.Error("upstream rejected credentials; retrying", "err", err, "retry_in", d)
+				if s.wait(ctx, d, nil) != nil {
 					return
 				}
 				continue
@@ -173,7 +240,6 @@ func (s *Session) Run(ctx context.Context) {
 			}
 			continue
 		}
-		s.backoff.Reset()
 		if everConnected && s.cfg.Hooks.Reconnect != nil {
 			s.cfg.Hooks.Reconnect()
 		}
@@ -184,62 +250,108 @@ func (s *Session) Run(ctx context.Context) {
 		if s.cfg.TokenExpiry != nil {
 			exp = s.cfg.TokenExpiry()
 		}
-		reason := s.serve(ctx, client, pass, exp)
+		upAt := time.Now()
+		reason, delivered := s.serve(ctx, client, lost, pass, exp)
 		client.Disconnect(250)
 		s.setConnected(false)
 		s.log.Info("upstream session closed", "reason", reason)
-		if reason == "idle" || reason == "stopped" {
+		switch reason {
+		case "idle", "stopped":
+			return
+		case "renewing token":
+			continue
+		}
+		if delivered || time.Since(upAt) >= stableAfter {
+			s.backoff.Reset()
+		}
+		d := s.backoff.Next()
+		if s.wait(ctx, d, nil) != nil {
 			return
 		}
 	}
 }
 
 func (s *Session) setConnected(up bool) {
+	s.connected.Store(up)
 	if s.cfg.Hooks.Connected != nil {
 		s.cfg.Hooks.Connected(up)
 	}
 }
 
 // serve publishes from the queue until the connection drops, the token needs
-// renewing, the session goes idle or ctx ends.
-func (s *Session) serve(ctx context.Context, client paho.Client, usedPass string, usedExp time.Time) string {
+// renewing, the session goes idle or ctx ends. delivered reports whether any
+// publish succeeded on this connection.
+func (s *Session) serve(ctx context.Context, client paho.Client, lost <-chan struct{}, usedPass string, usedExp time.Time) (reason string, delivered bool) {
 	for {
 		if ctx.Err() != nil {
-			return "stopped"
+			return "stopped", delivered
 		}
-		if s.idle() {
-			return "idle"
+		if s.tryClose() {
+			return "idle", delivered
 		}
-		if !client.IsConnectionOpen() {
-			return "connection lost"
+		select {
+		case <-lost:
+			return "connection lost", delivered
+		default:
 		}
 		if !usedExp.IsZero() && time.Until(usedExp) < s.cfg.Session.RenewBefore {
 			if _, pass, ok := s.cfg.Creds(); ok && pass != usedPass {
-				return "renewing token"
+				return "renewing token", delivered
 			}
 		}
 		pctx, cancel := context.WithTimeout(ctx, s.poll())
+		go func() {
+			select {
+			case <-lost:
+				cancel()
+			case <-pctx.Done():
+			}
+		}()
 		m, err := s.q.Pop(pctx)
 		cancel()
 		if err != nil {
 			continue
 		}
 		tok := client.Publish(m.Topic, m.QoS, m.Retain, m.Payload)
-		if !tok.WaitTimeout(10*time.Second) || tok.Error() != nil {
-			s.q.Unpop(m)
-			return fmt.Sprintf("publish failed: %v", tok.Error())
+		// A publish on a connection the broker just dropped never completes;
+		// fail it as soon as paho reports the loss rather than at the timeout.
+		ok := false
+		timeout := time.NewTimer(10 * time.Second)
+		select {
+		case <-tok.Done():
+			ok = tok.Error() == nil
+		case <-lost:
+		case <-timeout.C:
 		}
+		timeout.Stop()
+		if !ok {
+			m.attempts++
+			if m.attempts >= maxPublishAttempts {
+				s.log.Warn("dropping message after repeated publish failures", "topic", m.Topic, "attempts", m.attempts)
+				if s.cfg.Hooks.Dropped != nil {
+					s.cfg.Hooks.Dropped("publish_failed")
+				}
+			} else {
+				s.q.Unpop(m)
+			}
+			return fmt.Sprintf("publish failed: %v", tok.Error()), delivered
+		}
+		delivered = true
 		if s.cfg.Hooks.Published != nil {
 			s.cfg.Hooks.Published()
 		}
 	}
 }
 
-func (s *Session) connect(user, pass string) (paho.Client, error) {
+// connect dials the upstream. lost is closed when paho reports the
+// connection gone.
+func (s *Session) connect(user, pass string) (paho.Client, <-chan struct{}, error) {
 	broker, err := brokerURL(s.cfg.Upstream.Preset.URL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	lost := make(chan struct{})
+	var lostOnce sync.Once
 	opts := paho.NewClientOptions().
 		AddBroker(broker).
 		SetClientID("mcproxy-" + s.cfg.Device[:16]).
@@ -261,20 +373,22 @@ func (s *Session) connect(user, pass string) (paho.Client, error) {
 	if ka := s.cfg.Upstream.Preset.KeepAlive; ka > 0 {
 		opts.SetKeepAlive(ka)
 	}
+	opts.SetConnectionLostHandler(func(paho.Client, error) { lostOnce.Do(func() { close(lost) }) })
 	tlsCfg, err := tlsConfig(s.cfg.Upstream.CAFile)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	opts.SetTLSConfig(tlsCfg)
 	client := paho.NewClient(opts)
 	tok := client.Connect()
 	if !tok.WaitTimeout(15 * time.Second) {
-		return nil, errors.New("connect timed out")
+		client.Disconnect(0)
+		return nil, nil, errors.New("connect timed out")
 	}
 	if err := tok.Error(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return client, nil
+	return client, lost, nil
 }
 
 // brokerURL maps preset schemes onto paho's.

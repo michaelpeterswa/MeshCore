@@ -16,7 +16,9 @@ import (
 
 // Serve runs the proxy until ctx ends: local subscriber, router, and the
 // /healthz and /metrics listener.
-func Serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+func Serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
+	ctx, stop := context.WithCancel(parent)
+	defer stop()
 	m := metrics.New()
 	cache := tokens.New(time.Now)
 	router := NewRouter(cfg, cache, m, log)
@@ -42,8 +44,10 @@ func Serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	routerDone := make(chan struct{})
 	go func() { router.Run(ctx); close(routerDone) }()
 	localDone := make(chan struct{})
+	localErr := make(chan error, 1)
 	go func() {
-		local.Run(ctx, cfg.Local, router.Handle, func(up bool) {
+		defer close(localDone)
+		localErr <- local.Run(ctx, cfg.Local, router.Handle, func(up bool) {
 			localUp.Store(up)
 			v := 0.0
 			if up {
@@ -51,19 +55,23 @@ func Serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 			m.LocalConnected.Set(v)
 		}, log)
-		close(localDone)
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
-	case err := <-httpErr:
-		return err
+	case runErr = <-httpErr:
+	case runErr = <-localErr:
 	}
+	if runErr != nil {
+		log.Error("stopping", "err", runErr)
+	}
+	stop()
 	log.Info("shutting down")
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdown)
 	<-localDone
 	<-routerDone
-	return nil
+	return runErr
 }

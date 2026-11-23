@@ -31,7 +31,7 @@ The gateway publishes `meshcore/{iata}/{device}/auth/{audience}` (retained) with
 
 **Clock:** tokens carry the device's notion of time. A gateway that has not synced NTP signs tokens dated 2024, which the proxy refuses as expired (logged once per device and audience). Firmware from `2850e34c` onward syncs NTP without waiting for a broker.
 
-When an upstream refuses a token, the session stops trying until the device publishes a newer one. When the token in use is within `renew_before` of expiring and a newer one is cached, the session reconnects with it.
+When an upstream refuses a token, the session stops trying until the device publishes a newer one. An upstream with fixed credentials (user/password, none) that refuses is retried at the slowest backoff (5 min). Reconnects back off from 1 s to 5 min. The backoff only resets after a connection has delivered a message or stayed up 30 s, so a broker that accepts CONNECT and then drops the client is not hammered. When the token in use is within `renew_before` of expiring and a newer one is cached, the session reconnects with it.
 
 ## Configuration
 
@@ -39,7 +39,7 @@ When an upstream refuses a token, the session stops trying until the device publ
 
 | Key | Default | Notes |
 |---|---|---|
-| `listen` | `:8080` | `/healthz` (200 while the local broker is connected, else 503) and `/metrics` |
+| `listen` | `:8080` | `/healthz` (200 while the local broker is connected, else 503) and `/metrics`. Run with a liveness probe on `/healthz`: the proxy restarts nothing itself while the local broker is away. If the local broker refuses the subscription, the process exits non-zero. |
 | `local.broker` | required | `tcp://host:1883` (also `mqtt://`, `ssl://`, `mqtts://`) |
 | `local.client_id` | `meshcore-mqtt-proxy` | |
 | `local.username`, `local.password` | none | `local.password_file` wins over `local.password` |
@@ -48,7 +48,7 @@ When an upstream refuses a token, the session stops trying until the device publ
 | `session.queue_size` | `256` | per device per upstream; the oldest message is dropped when full |
 | `upstreams[].name` | required | unique; used in logs and metrics |
 | `upstreams[].preset` | one of `preset`/`url` | a name from `src/helpers/MQTTPresets.h` (`analyzer-us`, `cascadiamesh`, `meshrank`, …) |
-| `upstreams[].url` | | `mqtt://`, `mqtts://`, `ws://`, `wss://`; with `preset`, overrides its URL |
+| `upstreams[].url` | | `mqtt://`, `mqtts://`, `ws://`, `wss://`; with `preset`, overrides its URL. Overriding a JWT preset's URL requires `audience`, so the preset's live token is never sent to another host by accident. |
 | `upstreams[].audience` | preset's | with `url` alone, makes it a JWT upstream |
 | `upstreams[].username`, `password`, `password_file` | preset's | with `url` alone and a username, makes it a user/password upstream |
 | `upstreams[].meshrank_token` | | required for `meshrank` |
@@ -65,7 +65,7 @@ All are prefixed `meshcore_proxy_`.
 |---|---|---|
 | `messages_in_total` | `device` | forwardable messages received locally |
 | `messages_out_total` | `device`, `upstream` | messages published upstream |
-| `dropped_total` | `upstream`, `reason` | `queue_full`, `no_token` |
+| `dropped_total` | `upstream`, `reason` | `queue_full`, `no_token`, `publish_failed` (3 failed attempts), `idle_undelivered` (queued while disconnected, session went idle) |
 | `malformed_total` | | unparseable topics, non-JSON payloads |
 | `reconnects_total` | `upstream` | upstream connections re-established after a loss |
 | `token_expiry_timestamp_seconds` | `device`, `audience` | when the cached token expires |
