@@ -35,6 +35,7 @@ does not reflect the GoogleTest count — run the built binary directly
 | `test_mqtt_prefs_codec` | `src/helpers/MQTTPrefsStorage.h`, `src/helpers/MQTTPrefsCodec.h` | binary pre-slot/3-slot/6-slot migration fixtures; v1 header integrity; downgrade preservation; shortest-payload write policy (default filters stay downgrade-readable) |
 | `test_mqtt_prefs_atomic_store` | `src/helpers/MQTTPrefsAtomicStore.h` | transactional MQTT writes and legacy `/node_prefs` handoff; exact short-write detection; begin/finish/rename failure cleanup; original-file preservation |
 | `test_mqtt_payload_builder` | `src/helpers/MQTTPayloadBuilder.cpp` | status/packet/raw JSON contracts; optional fields; escaping; RX metrics and path; score handling; exact buffer bounds; maximum representative payloads |
+| `test_telnet_auth` | `src/helpers/TelnetAuth.h` | Ethernet telnet CLI login gate: exact-match admin password (no prefix/empty/null match), 3-strike disconnect and lockout surviving a new session, unauthenticated-session timeout, 32-bit `millis()` rollover |
 | `test_utils` | `src/Utils.cpp` | `Utils::toHex` (upstream) |
 
 ## Conventions (and how to add a suite)

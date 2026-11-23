@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <RAK13800_W5100S.h>
 #include <helpers/nrf52/EthernetMac.h>
+#include <helpers/TelnetAuth.h>
 
 #define PIN_SPI1_MISO (29)
 #define PIN_SPI1_MOSI (30)
@@ -30,6 +31,9 @@ static SPIClass ETHERNET_SPI_PORT(NRF_SPIM1, PIN_SPI1_MISO, PIN_SPI1_SCK, PIN_SP
 static EthernetServer ethernet_server(ETHERNET_TCP_PORT);
 static EthernetClient ethernet_client;
 static volatile bool ethernet_running = false;
+// Telnet runs commands with serial-console authority, so it needs the admin
+// password first (see TelnetAuth.h).
+static TelnetAuth ethernet_auth;
 
 // FreeRTOS task: handles hw init, DHCP, and retries in the background
 static void ethernet_task(void* param) {
@@ -105,11 +109,20 @@ static bool ethernet_handle_command(const char* command, char* reply) {
 static void ethernet_check_client() {
   auto newClient = ethernet_server.accept();
   if (newClient) {
+    IPAddress ip = newClient.remoteIP();
+    if (ethernet_auth.lockedOut(millis())) {
+      // Refuse without disturbing the current session.
+      Serial.printf("ETH: Refused %u.%u.%u.%u (locked out)\n", ip[0], ip[1], ip[2], ip[3]);
+      newClient.println("Too many failed logins, try again later");
+      newClient.stop();
+      return;
+    }
     if (ethernet_client) ethernet_client.stop();
     ethernet_client = newClient;
-    IPAddress ip = ethernet_client.remoteIP();
+    ethernet_auth.begin(millis());
     Serial.printf("ETH: Client connected from %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
     ethernet_client.println(ETHERNET_CLI_BANNER);
+    ethernet_client.print("Password: ");
   }
 }
 
@@ -117,14 +130,22 @@ static void ethernet_check_client() {
 static void ethernet_loop_maintain() {
   if (ethernet_running) {
     ethernet_check_client();
+    if (ethernet_client && ethernet_client.connected() && ethernet_auth.loginTimedOut(millis())) {
+      ethernet_client.println();
+      ethernet_client.println("Login timed out");
+      ethernet_client.stop();
+    }
     Ethernet.maintain();
   }
 }
 
 // Read a line from the Ethernet client into the command buffer.
-// Returns true when a complete line is ready to process (command is null-terminated).
-// The caller should process the command and then reset ethernet_command[0] = 0.
-static bool ethernet_read_line(char* ethernet_command, size_t buf_size) {
+// Returns true when a complete, authenticated command is ready to process
+// (command is null-terminated); the caller should process it and then reset
+// ethernet_command[0] = 0. Until the session has logged in with
+// admin_password, lines are consumed here as password attempts and never
+// returned.
+static bool ethernet_read_line(char* ethernet_command, size_t buf_size, const char* admin_password) {
   if (!ethernet_running || !ethernet_client || !ethernet_client.connected()) return false;
 
   int elen = strlen(ethernet_command);
@@ -142,7 +163,22 @@ static bool ethernet_read_line(char* ethernet_command, size_t buf_size) {
   if (elen > 0 && ethernet_command[elen - 1] == '\r') {
     ethernet_command[elen - 1] = 0;
     ethernet_client.println();
-    return true;
+    if (ethernet_auth.authed()) return true;
+
+    TelnetAuth::Result r = ethernet_auth.submit(ethernet_command, admin_password, millis());
+    ethernet_command[0] = 0;   // never keep (or log) a password attempt
+    if (r == TelnetAuth::Result::Accepted) {
+      ethernet_client.println("  -> OK");
+    } else if (r == TelnetAuth::Result::Rejected) {
+      ethernet_client.println("  -> ERR: bad password");
+      ethernet_client.print("Password: ");
+    } else {
+      IPAddress ip = ethernet_client.remoteIP();
+      Serial.printf("ETH: Too many failed logins from %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
+      ethernet_client.println("  -> ERR: too many failed logins");
+      ethernet_client.stop();
+    }
+    return false;
   }
   return false;
 }

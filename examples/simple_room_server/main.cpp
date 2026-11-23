@@ -158,7 +158,7 @@ static void mainLoopBody() {
 
 #ifdef ETHERNET_ENABLED
   ethernet_loop_maintain();
-  if (ethernet_read_line(ethernet_command, sizeof(ethernet_command))) {
+  if (ethernet_read_line(ethernet_command, sizeof(ethernet_command), the_mesh.getNodePrefs()->password)) {
     char reply[160];
     reply[0] = 0;
     if (!ethernet_handle_command(ethernet_command, reply)) {
