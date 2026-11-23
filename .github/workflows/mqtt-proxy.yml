@@ -1,0 +1,60 @@
+name: mqtt-proxy
+
+on:
+  push:
+    branches: [feat/nrf52-ethernet-observer]
+    tags: ["mqtt-proxy-v*"]
+    paths: ["tools/mqtt-proxy/**", ".github/workflows/mqtt-proxy.yml", "src/helpers/MQTTPresets.h"]
+  pull_request:
+    paths: ["tools/mqtt-proxy/**", ".github/workflows/mqtt-proxy.yml", "src/helpers/MQTTPresets.h"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/mqtt-proxy
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/mqtt-proxy/go.mod
+          cache-dependency-path: tools/mqtt-proxy/go.sum
+      - run: go vet ./...
+      # The presets test reads src/helpers/MQTTPresets.h, so a firmware preset
+      # change without the matching proxy change fails here.
+      - run: go test -race ./...
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/meshcore-mqtt-proxy
+          tags: |
+            type=sha,prefix=,format=short
+            type=match,pattern=mqtt-proxy-v(.*),group=1
+      - uses: docker/build-push-action@v6
+        with:
+          context: tools/mqtt-proxy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

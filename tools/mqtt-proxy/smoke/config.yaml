@@ -1,0 +1,6 @@
+listen: ":8080"
+local:
+  broker: tcp://lan:1883
+upstreams:
+  - name: fake-analyzer
+    url: mqtt://analyzer:1883

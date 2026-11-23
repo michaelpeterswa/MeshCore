@@ -1,0 +1,18 @@
+# Smoke test: real mosquitto on both sides of the proxy.
+#   docker compose -f compose.smoke.yaml up --build -d
+#   ./smoke/run.sh
+#   docker compose -f compose.smoke.yaml down
+services:
+  lan:
+    image: eclipse-mosquitto:2.0.22
+    volumes: ["./smoke/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"]
+    ports: ["127.0.0.1:18831:1883"]
+  analyzer:
+    image: eclipse-mosquitto:2.0.22
+    volumes: ["./smoke/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"]
+    ports: ["127.0.0.1:18832:1883"]
+  proxy:
+    build: .
+    volumes: ["./smoke/config.yaml:/etc/mqtt-proxy/config.yaml:ro"]
+    ports: ["127.0.0.1:18080:8080"]
+    depends_on: [lan, analyzer]

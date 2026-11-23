@@ -1,0 +1,36 @@
+# MeshCore MQTT LAN proxy. Every key is documented in README.md.
+
+listen: ":8080"            # /healthz and /metrics
+
+local:                     # the LAN broker the gateways publish to
+  broker: tcp://mosquitto.mosquitto.svc.cluster.local:1883
+  client_id: meshcore-mqtt-proxy
+  username: mqtt-proxy
+  password_file: /secrets/local-password
+
+session:
+  idle_timeout: 10m        # close a device's upstream connection after this long without traffic
+  renew_before: 10m        # reconnect with a newer device token this long before the current one expires
+  queue_size: 256          # per device per upstream; oldest dropped when full
+
+upstreams:
+  # JWT analyzers: the device must sign a token for the preset's audience
+  # (firmware: set mqtt.auth.aud <audience>[,<audience>...]).
+  - name: letsmesh-us
+    preset: analyzer-us
+
+  # - name: cascadia
+  #   preset: cascadiamesh
+
+  # MeshRank: no raw topic; needs your uplink token.
+  # - name: meshrank
+  #   preset: meshrank
+  #   meshrank_token: <token>
+
+  # Any other broker.
+  # - name: private
+  #   url: mqtts://broker.example:8883
+  #   username: me
+  #   password_file: /secrets/private-password
+  #   ca_file: /etc/ssl/private-ca.pem   # extra trust root, added to the system roots
+  #   allow_retain: true
