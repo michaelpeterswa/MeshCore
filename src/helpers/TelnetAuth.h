@@ -16,14 +16,19 @@ public:
 
   static const uint8_t kMaxAttempts = 3;
   static const uint32_t kLoginTimeoutMs = 30000UL;   // unauthenticated session is closed after this
-  static const uint32_t kLockoutMs = 30000UL;        // new connections refused after kMaxAttempts failures
+  static const uint32_t kLockoutMs = 30000UL;        // first lockout after kMaxAttempts failures
+  static const uint32_t kMaxLockoutMs = 900000UL;    // each further lockout doubles, up to this
 
-  TelnetAuth() : _authed(false), _failures(0), _locked(false), _session_start(0), _locked_at(0) { }
+  TelnetAuth() : _authed(false), _failures(0), _lockouts(0), _locked(false),
+                 _session_start(0), _locked_at(0), _lockout_ms(0) { }
 
-  /** A new client connected. Failures reset; an active lockout does not. */
+  /**
+   * A new client connected. Neither the failure count nor an active lockout
+   * resets here: otherwise reconnecting would buy a fresh set of guesses.
+   * Only a successful login clears them.
+   */
   void begin(uint32_t now) {
     _authed = false;
-    _failures = 0;
     _session_start = now;
   }
 
@@ -34,9 +39,15 @@ public:
     if (matches(line, password)) {
       _authed = true;
       _failures = 0;
+      _lockouts = 0;
       return Result::Accepted;
     }
     if (++_failures >= kMaxAttempts) {
+      uint32_t ms = kLockoutMs;
+      for (uint8_t i = 0; i < _lockouts && ms < kMaxLockoutMs; i++) ms *= 2;
+      _lockout_ms = ms < kMaxLockoutMs ? ms : kMaxLockoutMs;
+      if (_lockouts < 0xFF) _lockouts++;
+      _failures = 0;   // the next round starts once this lockout expires
       _locked = true;
       _locked_at = now;
       return Result::Disconnect;
@@ -49,7 +60,7 @@ public:
   }
 
   bool lockedOut(uint32_t now) const {
-    return _locked && (uint32_t)(now - _locked_at) < kLockoutMs;
+    return _locked && (uint32_t)(now - _locked_at) < _lockout_ms;
   }
 
 private:
@@ -71,8 +82,10 @@ private:
   }
 
   bool _authed;
-  uint8_t _failures;
+  uint8_t _failures;      // since the last success or lockout, across connections
+  uint8_t _lockouts;      // consecutive lockouts since the last success
   bool _locked;
   uint32_t _session_start;
   uint32_t _locked_at;
+  uint32_t _lockout_ms;
 };
